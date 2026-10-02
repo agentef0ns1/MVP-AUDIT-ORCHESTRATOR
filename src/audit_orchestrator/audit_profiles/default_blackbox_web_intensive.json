@@ -1,0 +1,410 @@
+{
+  "profile_id": "default_blackbox_web_intensive",
+  "description": "Intensive web-focused black-box security audit profile",
+  "max_time_per_service": 1800,
+  "restrictions": {
+    "no_bruteforce": true,
+    "no_dos": true,
+    "no_exploit_execution": true,
+    "safe_mode": true
+  },
+  "tasks": {
+    "all_services": [
+      {
+        "type": "nmap_version",
+        "command": "nmap -sV -p {port} {target}",
+        "description": "Detect service version"
+      }
+    ],
+    "http": [
+      {
+        "type": "whatweb",
+        "command": "whatweb http://{target}:{port}",
+        "description": "Web technology fingerprinting"
+      },
+      {
+        "type": "waf_detect",
+        "command": "wafw00f http://{target}:{port}",
+        "description": "Detect Web Application Firewall"
+      },
+      {
+        "type": "nikto",
+        "command": "nikto -h http://{target}:{port} -Tuning 123bde -maxtime 8m",
+        "description": "Web vulnerability scanner"
+      },
+      {
+        "type": "web_fuzzing",
+        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/big.txt -mc 200,301,302,401,403 -t 50 -fs 0 -timeout 15",
+        "description": "Extensive directory and file fuzzing"
+      },
+      {
+        "type": "http_methods",
+        "command": "nmap --script http-methods -p {port} {target}",
+        "description": "Enumerate HTTP methods"
+      },
+      {
+        "type": "http_headers",
+        "command": "curl -I http://{target}:{port}",
+        "description": "Analyze HTTP headers"
+      },
+      {
+        "type": "download_js_files",
+        "command": "wget -r -l 2 -np -nd -A.js http://{target}:{port}/ -P /tmp/js_analysis/{target}_{port}/ 2>&1 || true",
+        "description": "Download exposed JavaScript files for analysis (recursive depth 2)"
+      },
+      {
+        "type": "js_secrets_scan",
+        "command": "trufflehog filesystem --directory /tmp/js_analysis/{target}_{port}/ --json 2>&1 || true",
+        "description": "Scan JS files for hardcoded secrets, API keys, tokens"
+      },
+      {
+        "type": "js_endpoints_extract",
+        "command": "grep -rEoh \"(http|https)://[a-zA-Z0-9./?=_-]*\" /tmp/js_analysis/{target}_{port}/ 2>&1 || linkfinder -i http://{target}:{port} -o cli 2>&1 || true",
+        "description": "Extract API endpoints and URLs from JavaScript"
+      },
+      {
+        "type": "wappalyzer_scan",
+        "command": "wappalyzer http://{target}:{port} --pretty 2>&1 || true",
+        "description": "Deep technology stack fingerprinting"
+      },
+      {
+        "type": "retire_js",
+        "command": "retire --path http://{target}:{port} --outputformat json 2>&1 || true",
+        "description": "Detect vulnerable JavaScript libraries"
+      },
+      {
+        "type": "param_fuzzing",
+        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/big.txt -mc 200,301,302,401,403 -t 50 -recursion -recursion-depth 3 -timeout 15 2>&1 || true",
+        "description": "Deep recursive directory fuzzing"
+      },
+      {
+        "type": "param_discovery",
+        "command": "arjun -u http://{target}:{port}/ -oJ /tmp/params_{target}_{port}.json 2>&1 || true",
+        "description": "Discover hidden GET/POST parameters"
+      },
+      {
+        "type": "vhost_fuzzing",
+        "command": "ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-10000.txt -u http://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 50 2>&1 || true",
+        "description": "Extensive virtual host discovery"
+      },
+      {
+        "type": "api_endpoints_enum",
+        "command": "feroxbuster -u http://{target}:{port}/api -w /usr/share/wordlists/dirb/big.txt -x json,xml,yaml,yml -t 100 -C 404 --timeout 15 2>&1 || true",
+        "description": "Comprehensive API endpoints enumeration"
+      },
+      {
+        "type": "swagger_scan",
+        "command": "curl -s http://{target}:{port}/swagger.json || curl -s http://{target}:{port}/api-docs || curl -s http://{target}:{port}/openapi.json || curl -s http://{target}:{port}/v2/api-docs || curl -s http://{target}:{port}/v3/api-docs 2>&1 || true",
+        "description": "Discover Swagger/OpenAPI documentation (multiple paths)"
+      },
+      {
+        "type": "graphql_introspection",
+        "command": "graphw00f -t http://{target}:{port}/graphql 2>&1 || curl -X POST http://{target}:{port}/graphql -H 'Content-Type: application/json' -d '{\"query\":\"{__schema{types{name}}}\"}' 2>&1 || true",
+        "description": "GraphQL introspection and fingerprinting"
+      },
+      {
+        "type": "api_fuzzing",
+        "command": "wfuzz -z file,/usr/share/seclists/Fuzzing/api-endpoints.txt http://{target}:{port}/api/FUZZ -hc 404 --hh BBB 2>&1 || true",
+        "description": "API endpoint fuzzing"
+      },
+      {
+        "type": "backup_files",
+        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-large-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz,.sql,.db -t 50 2>&1 || true",
+        "description": "Extensive search for backup files and archives"
+      },
+      {
+        "type": "git_exposed",
+        "command": "wget --mirror --no-parent http://{target}:{port}/.git/ -P /tmp/git_{target}_{port}/ 2>&1 || git-dumper http://{target}:{port}/.git/ /tmp/git_{target}_{port}/ 2>&1 || true",
+        "description": "Check for exposed .git directory"
+      },
+      {
+        "type": "env_files",
+        "command": "curl -s http://{target}:{port}/.env || curl -s http://{target}:{port}/.env.local || curl -s http://{target}:{port}/.env.production || curl -s http://{target}:{port}/.env.development 2>&1 || true",
+        "description": "Check for exposed environment files (multiple variants)"
+      },
+      {
+        "type": "robots_sitemap",
+        "command": "curl -s http://{target}:{port}/robots.txt && curl -s http://{target}:{port}/sitemap.xml 2>&1 || true",
+        "description": "Analyze robots.txt and sitemap for hidden paths"
+      },
+      {
+        "type": "directory_listing",
+        "command": "curl -s http://{target}:{port}/ | grep -i 'Index of' 2>&1 || dirb http://{target}:{port}/ -w -S -X .bak,.old 2>&1 || true",
+        "description": "Check for directory listing vulnerabilities"
+      },
+      {
+        "type": "security_headers",
+        "command": "shcheck.py http://{target}:{port} 2>&1 || curl -I http://{target}:{port} | grep -iE '(X-Frame-Options|Content-Security-Policy|Strict-Transport-Security|X-Content-Type-Options)' 2>&1 || true",
+        "description": "Analyze security headers"
+      },
+      {
+        "type": "cors_misconfig",
+        "command": "curl -H 'Origin: http://evil.com' -I http://{target}:{port}/ | grep -i 'Access-Control-Allow-Origin' 2>&1 || true",
+        "description": "Test for CORS misconfiguration"
+      },
+      {
+        "type": "clickjacking_test",
+        "command": "curl -I http://{target}:{port}/ | grep -i 'X-Frame-Options' 2>&1 || true",
+        "description": "Check for clickjacking protection"
+      },
+      {
+        "type": "http_trace",
+        "command": "nmap --script http-trace -p {port} {target}",
+        "description": "Check if HTTP TRACE is enabled"
+      },
+      {
+        "type": "login_page_detect",
+        "command": "whatweb http://{target}:{port} | grep -iE '(login|signin|auth)' 2>&1 || curl -s http://{target}:{port} | grep -iE 'type=\"password\"' 2>&1 || true",
+        "description": "Detect authentication pages"
+      },
+      {
+        "type": "default_creds_test",
+        "command": "nmap --script http-default-accounts -p {port} {target}",
+        "description": "Test common default credentials"
+      },
+      {
+        "type": "session_analysis",
+        "command": "curl -c /tmp/cookies_{target}_{port}.txt http://{target}:{port}/ 2>&1 && cat /tmp/cookies_{target}_{port}.txt | grep -iE '(secure|httponly|samesite)' 2>&1 || true",
+        "description": "Analyze session cookie security flags"
+      },
+      {
+        "type": "wordpress_scan",
+        "command": "wpscan --url http://{target}:{port} --enumerate ap,vp,vt,tt,cb,dbe,u --random-user-agent --disable-tls-checks --max-threads 10 2>&1 || true",
+        "description": "Comprehensive WordPress vulnerability scanning"
+      },
+      {
+        "type": "drupal_scan",
+        "command": "droopescan scan drupal -u http://{target}:{port} 2>&1 || true",
+        "description": "Drupal vulnerability scanning"
+      },
+      {
+        "type": "joomla_scan",
+        "command": "joomscan -u http://{target}:{port} 2>&1 || true",
+        "description": "Joomla vulnerability scanning"
+      },
+      {
+        "type": "cms_generic",
+        "command": "cmseek -u http://{target}:{port} --follow-redirect --batch 2>&1 || true",
+        "description": "Generic CMS detection and scanning"
+      }
+    ],
+    "https": [
+      {
+        "type": "ssl_scan",
+        "command": "sslscan {target}:{port}",
+        "description": "SSL/TLS configuration analysis"
+      },
+      {
+        "type": "testssl",
+        "command": "testssl.sh --warnings off {target}:{port}",
+        "description": "Comprehensive SSL/TLS testing"
+      },
+      {
+        "type": "ssl_cert",
+        "command": "nmap --script ssl-cert -p {port} {target}",
+        "description": "SSL certificate information"
+      },
+      {
+        "type": "whatweb",
+        "command": "whatweb https://{target}:{port}",
+        "description": "Web technology fingerprinting"
+      },
+      {
+        "type": "waf_detect",
+        "command": "wafw00f https://{target}:{port}",
+        "description": "Detect Web Application Firewall"
+      },
+      {
+        "type": "web_fuzzing",
+        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/big.txt -mc 200,301,302,401,403 -t 50 -fs 0 -timeout 15",
+        "description": "Extensive directory and file fuzzing"
+      },
+      {
+        "type": "download_js_files",
+        "command": "wget -r -l 2 -np -nd -A.js https://{target}:{port}/ -P /tmp/js_analysis/{target}_{port}/ --no-check-certificate 2>&1 || true",
+        "description": "Download exposed JavaScript files for analysis (recursive depth 2)"
+      },
+      {
+        "type": "js_secrets_scan",
+        "command": "trufflehog filesystem --directory /tmp/js_analysis/{target}_{port}/ --json 2>&1 || true",
+        "description": "Scan JS files for hardcoded secrets, API keys, tokens"
+      },
+      {
+        "type": "js_endpoints_extract",
+        "command": "grep -rEoh \"(http|https)://[a-zA-Z0-9./?=_-]*\" /tmp/js_analysis/{target}_{port}/ 2>&1 || linkfinder -i https://{target}:{port} -o cli 2>&1 || true",
+        "description": "Extract API endpoints and URLs from JavaScript"
+      },
+      {
+        "type": "wappalyzer_scan",
+        "command": "wappalyzer https://{target}:{port} --pretty 2>&1 || true",
+        "description": "Deep technology stack fingerprinting"
+      },
+      {
+        "type": "retire_js",
+        "command": "retire --path https://{target}:{port} --outputformat json 2>&1 || true",
+        "description": "Detect vulnerable JavaScript libraries"
+      },
+      {
+        "type": "param_fuzzing",
+        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/big.txt -mc 200,301,302,401,403 -t 50 -recursion -recursion-depth 3 -timeout 15 2>&1 || true",
+        "description": "Deep recursive directory fuzzing"
+      },
+      {
+        "type": "param_discovery",
+        "command": "arjun -u https://{target}:{port}/ -oJ /tmp/params_{target}_{port}.json 2>&1 || true",
+        "description": "Discover hidden GET/POST parameters"
+      },
+      {
+        "type": "vhost_fuzzing",
+        "command": "ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-10000.txt -u https://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 50 2>&1 || true",
+        "description": "Extensive virtual host discovery"
+      },
+      {
+        "type": "api_endpoints_enum",
+        "command": "feroxbuster -u https://{target}:{port}/api -w /usr/share/wordlists/dirb/big.txt -x json,xml,yaml,yml -t 100 -C 404 --timeout 15 -k 2>&1 || true",
+        "description": "Comprehensive API endpoints enumeration"
+      },
+      {
+        "type": "swagger_scan",
+        "command": "curl -sk https://{target}:{port}/swagger.json || curl -sk https://{target}:{port}/api-docs || curl -sk https://{target}:{port}/openapi.json || curl -sk https://{target}:{port}/v2/api-docs || curl -sk https://{target}:{port}/v3/api-docs 2>&1 || true",
+        "description": "Discover Swagger/OpenAPI documentation (multiple paths)"
+      },
+      {
+        "type": "graphql_introspection",
+        "command": "graphw00f -t https://{target}:{port}/graphql 2>&1 || curl -k -X POST https://{target}:{port}/graphql -H 'Content-Type: application/json' -d '{\"query\":\"{__schema{types{name}}}\"}' 2>&1 || true",
+        "description": "GraphQL introspection and fingerprinting"
+      },
+      {
+        "type": "api_fuzzing",
+        "command": "wfuzz -z file,/usr/share/seclists/Fuzzing/api-endpoints.txt https://{target}:{port}/api/FUZZ -hc 404 --hh BBB 2>&1 || true",
+        "description": "API endpoint fuzzing"
+      },
+      {
+        "type": "backup_files",
+        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-large-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz,.sql,.db -t 50 2>&1 || true",
+        "description": "Extensive search for backup files and archives"
+      },
+      {
+        "type": "git_exposed",
+        "command": "wget --mirror --no-parent https://{target}:{port}/.git/ -P /tmp/git_{target}_{port}/ --no-check-certificate 2>&1 || git-dumper https://{target}:{port}/.git/ /tmp/git_{target}_{port}/ 2>&1 || true",
+        "description": "Check for exposed .git directory"
+      },
+      {
+        "type": "env_files",
+        "command": "curl -sk https://{target}:{port}/.env || curl -sk https://{target}:{port}/.env.local || curl -sk https://{target}:{port}/.env.production || curl -sk https://{target}:{port}/.env.development 2>&1 || true",
+        "description": "Check for exposed environment files (multiple variants)"
+      },
+      {
+        "type": "robots_sitemap",
+        "command": "curl -sk https://{target}:{port}/robots.txt && curl -sk https://{target}:{port}/sitemap.xml 2>&1 || true",
+        "description": "Analyze robots.txt and sitemap for hidden paths"
+      },
+      {
+        "type": "directory_listing",
+        "command": "curl -sk https://{target}:{port}/ | grep -i 'Index of' 2>&1 || dirb https://{target}:{port}/ -w -S -X .bak,.old 2>&1 || true",
+        "description": "Check for directory listing vulnerabilities"
+      },
+      {
+        "type": "security_headers",
+        "command": "shcheck.py https://{target}:{port} 2>&1 || curl -Isk https://{target}:{port} | grep -iE '(X-Frame-Options|Content-Security-Policy|Strict-Transport-Security|X-Content-Type-Options)' 2>&1 || true",
+        "description": "Analyze security headers"
+      },
+      {
+        "type": "cors_misconfig",
+        "command": "curl -k -H 'Origin: https://evil.com' -I https://{target}:{port}/ | grep -i 'Access-Control-Allow-Origin' 2>&1 || true",
+        "description": "Test for CORS misconfiguration"
+      },
+      {
+        "type": "clickjacking_test",
+        "command": "curl -Isk https://{target}:{port}/ | grep -i 'X-Frame-Options' 2>&1 || true",
+        "description": "Check for clickjacking protection"
+      },
+      {
+        "type": "http_trace",
+        "command": "nmap --script http-trace -p {port} {target}",
+        "description": "Check if HTTP TRACE is enabled"
+      },
+      {
+        "type": "login_page_detect",
+        "command": "whatweb https://{target}:{port} | grep -iE '(login|signin|auth)' 2>&1 || curl -sk https://{target}:{port} | grep -iE 'type=\"password\"' 2>&1 || true",
+        "description": "Detect authentication pages"
+      },
+      {
+        "type": "default_creds_test",
+        "command": "nmap --script http-default-accounts -p {port} {target}",
+        "description": "Test common default credentials"
+      },
+      {
+        "type": "session_analysis",
+        "command": "curl -k -c /tmp/cookies_{target}_{port}.txt https://{target}:{port}/ 2>&1 && cat /tmp/cookies_{target}_{port}.txt | grep -iE '(secure|httponly|samesite)' 2>&1 || true",
+        "description": "Analyze session cookie security flags"
+      },
+      {
+        "type": "wordpress_scan",
+        "command": "wpscan --url https://{target}:{port} --enumerate ap,vp,vt,tt,cb,dbe,u --random-user-agent --disable-tls-checks --max-threads 10 2>&1 || true",
+        "description": "Comprehensive WordPress vulnerability scanning"
+      },
+      {
+        "type": "drupal_scan",
+        "command": "droopescan scan drupal -u https://{target}:{port} 2>&1 || true",
+        "description": "Drupal vulnerability scanning"
+      },
+      {
+        "type": "joomla_scan",
+        "command": "joomscan -u https://{target}:{port} 2>&1 || true",
+        "description": "Joomla vulnerability scanning"
+      },
+      {
+        "type": "cms_generic",
+        "command": "cmseek -u https://{target}:{port} --follow-redirect --batch 2>&1 || true",
+        "description": "Generic CMS detection and scanning"
+      }
+    ]
+  },
+  "finding_rules": {
+    "auto_detect": {
+      "exposed_secrets": {
+        "keywords": ["api_key", "api key", "secret_key", "password", "token", "aws_access", "private_key"],
+        "pattern": "(api[_-]?key|secret[_-]?key|password|bearer|token|aws[_-]?access)",
+        "severity": "critical",
+        "cwe": "CWE-798"
+      },
+      "exposed_git": {
+        "keywords": [".git/config", ".git/HEAD", "git repository"],
+        "severity": "high",
+        "cwe": "CWE-538"
+      },
+      "exposed_env_files": {
+        "keywords": [".env", "DATABASE_URL", "DB_PASSWORD", "API_SECRET"],
+        "severity": "critical",
+        "cwe": "CWE-215"
+      },
+      "vulnerable_js_library": {
+        "keywords": ["known vulnerabilities", "outdated", "vulnerable version"],
+        "severity": "medium",
+        "cwe": "CWE-1035"
+      },
+      "wordpress_vulnerabilities": {
+        "keywords": ["WordPress", "plugin vulnerable", "theme vulnerable", "wp version"],
+        "severity": "high",
+        "cwe": "CWE-1035"
+      },
+      "cms_detection": {
+        "keywords": ["Drupal", "Joomla", "WordPress", "CMS detected"],
+        "severity": "info",
+        "cwe": "CWE-200"
+      }
+    }
+  },
+  "metadata": {
+    "version": "1.0",
+    "author": "MVP Audit Orchestrator",
+    "created": "2026-10-01",
+    "scope": "Intensive web-focused black-box security audit",
+    "compliance": [
+      "OWASP",
+      "OWASP Top 10",
+      "SANS Top 25"
+    ]
+  }
+}

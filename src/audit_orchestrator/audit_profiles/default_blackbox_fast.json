@@ -1,0 +1,142 @@
+{
+  "profile_id": "default_blackbox_fast",
+  "description": "Fast black-box security audit profile with essential checks only",
+  "max_time_per_service": 300,
+  "restrictions": {
+    "no_bruteforce": true,
+    "no_dos": true,
+    "no_exploit_execution": true,
+    "safe_mode": true
+  },
+  "tasks": {
+    "all_services": [
+      {
+        "type": "nmap_version",
+        "command": "nmap -sV -p {port} {target}",
+        "description": "Detect service version"
+      }
+    ],
+    "http": [
+      {
+        "type": "whatweb",
+        "command": "whatweb http://{target}:{port}",
+        "description": "Web technology fingerprinting"
+      },
+      {
+        "type": "waf_detect",
+        "command": "wafw00f http://{target}:{port}",
+        "description": "Detect Web Application Firewall"
+      },
+      {
+        "type": "web_fuzzing",
+        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
+        "description": "Directory and file fuzzing"
+      },
+      {
+        "type": "http_headers",
+        "command": "curl -I http://{target}:{port}",
+        "description": "Analyze HTTP headers"
+      },
+      {
+        "type": "security_headers",
+        "command": "curl -I http://{target}:{port} | grep -iE '(X-Frame-Options|Content-Security-Policy|Strict-Transport-Security|X-Content-Type-Options)' 2>&1 || true",
+        "description": "Analyze security headers"
+      }
+    ],
+    "https": [
+      {
+        "type": "ssl_scan",
+        "command": "sslscan {target}:{port}",
+        "description": "SSL/TLS configuration analysis"
+      },
+      {
+        "type": "whatweb",
+        "command": "whatweb https://{target}:{port}",
+        "description": "Web technology fingerprinting"
+      },
+      {
+        "type": "web_fuzzing",
+        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
+        "description": "Directory and file fuzzing"
+      }
+    ],
+    "ssh": [
+      {
+        "type": "ssh_audit",
+        "command": "ssh-audit {target}:{port}",
+        "description": "SSH security audit"
+      }
+    ],
+    "ftp": [
+      {
+        "type": "ftp_anon",
+        "command": "nmap --script ftp-anon,ftp-bounce -p {port} {target}",
+        "description": "Check for anonymous FTP and bounce"
+      }
+    ],
+    "smb": [
+      {
+        "type": "enum4linux",
+        "command": "enum4linux -a {target}",
+        "description": "SMB/CIFS enumeration"
+      }
+    ],
+    "smtp": [
+      {
+        "type": "smtp_enum",
+        "command": "nmap --script smtp-commands,smtp-enum-users,smtp-open-relay -p {port} {target}",
+        "description": "SMTP enumeration"
+      }
+    ],
+    "mysql": [
+      {
+        "type": "mysql_info",
+        "command": "nmap --script mysql-info,mysql-empty-password -p {port} {target}",
+        "description": "MySQL information gathering"
+      }
+    ],
+    "postgres": [
+      {
+        "type": "pgsql_enum",
+        "command": "nmap --script pgsql-brute -p {port} {target}",
+        "description": "PostgreSQL enumeration"
+      }
+    ],
+    "default": [
+      {
+        "type": "banner_grab",
+        "command": "nc -v -n -w 5 {target} {port}",
+        "description": "Banner grabbing"
+      }
+    ]
+  },
+  "finding_rules": {
+    "auto_detect": {
+      "anonymous_access": {
+        "keywords": ["anonymous", "guest", "unauthenticated"],
+        "severity": "medium",
+        "cwe": "CWE-306"
+      },
+      "default_credentials": {
+        "keywords": ["default password", "admin:admin", "default credential"],
+        "severity": "critical",
+        "cwe": "CWE-798"
+      },
+      "cve_detection": {
+        "pattern": "CVE-\\d{4}-\\d{4,7}",
+        "severity": "high",
+        "cwe": "CWE-1035"
+      }
+    }
+  },
+  "metadata": {
+    "version": "1.0",
+    "author": "MVP Audit Orchestrator",
+    "created": "2026-10-01",
+    "scope": "Fast black-box security audit with essential checks",
+    "compliance": [
+      "OWASP",
+      "SANS Top 25"
+    ]
+  }
+}

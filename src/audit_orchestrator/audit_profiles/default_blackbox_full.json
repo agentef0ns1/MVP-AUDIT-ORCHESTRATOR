@@ -1,0 +1,12 @@
+{
+  "profile_id": "default_blackbox_full",
+  "description": "Comprehensive full black-box security audit profile (complete variant)",
+  "extends": "default_blackbox",
+  "metadata": {
+    "version": "1.0",
+    "author": "MVP Audit Orchestrator",
+    "created": "2026-10-01",
+    "scope": "Full comprehensive black-box security audit",
+    "note": "This profile extends default_blackbox and includes all comprehensive checks"
+  }
+}

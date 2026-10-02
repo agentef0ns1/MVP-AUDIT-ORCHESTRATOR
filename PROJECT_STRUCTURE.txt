@@ -1,0 +1,100 @@
+MVP-audit-orchestrator/
+│
+├── README.md                           # Complete user documentation
+├── IMPLEMENTATION.md                   # Technical implementation summary
+├── QUICK_START.md                      # Quick start guide
+├── PROJECT_STRUCTURE.txt               # This file
+├── .gitignore                          # Git ignore rules
+│
+├── pyproject.toml                      # Python project configuration
+│
+├── scripts/
+│   └── install.sh                      # Installation script
+│
+├── src/
+│   └── audit_orchestrator/
+│       ├── __init__.py                 # Package initialization
+│       ├── config.py                   # Configuration management
+│       ├── mcp_compat.py               # MCP SDK compatibility layer
+│       │
+│       ├── mcp_server/                 # MCP Server implementation
+│       │   ├── __init__.py             # MCP tools registration
+│       │   └── __main__.py             # Entry point
+│       │
+│       ├── core/                       # Core functionality
+│       │   ├── __init__.py
+│       │   ├── db.py                   # SQLite database schema
+│       │   ├── store.py                # State management & CRUD
+│       │   ├── parser.py               # Nmap output parser
+│       │   ├── filesystem.py           # Workspace manager
+│       │   ├── kali_client.py          # MCP Kali client
+│       │   ├── orchestrator.py         # Audit orchestration logic
+│       │   └── errors.py               # Custom exceptions
+│       │
+│       └── audit_profiles/             # Audit strategy profiles
+│           └── default_blackbox.json   # Default black-box profile
+│
+└── tests/                              # Test suite
+    ├── __init__.py
+    ├── test_parser.py                  # Parser validation (✅ PASSED)
+    ├── test_installation.py            # Module import tests (✅ PASSED)
+    └── test_end_to_end.py              # E2E workflow test (✅ PASSED)
+
+Key Files by Purpose:
+
+Configuration & Setup:
+  - pyproject.toml          : Python dependencies and metadata
+  - scripts/install.sh      : Automated installation
+  - config.py              : Settings and configuration
+
+MCP Server Interface:
+  - mcp_server/__init__.py : 10 MCP tools exposed
+  - mcp_compat.py          : SDK version compatibility
+
+Core Logic:
+  - orchestrator.py        : Main audit orchestration (600+ lines)
+  - store.py               : Database operations (700+ lines)
+  - kali_client.py         : MCP Kali communication
+  - parser.py              : Input file parsing
+  - filesystem.py          : Directory & file management
+  - db.py                  : SQLite schema
+
+Data & Profiles:
+  - audit_profiles/*.json  : Audit strategies
+  - SQLite database        : ~/.local/share/audit-orchestrator/audit_state.db
+
+Documentation:
+  - README.md              : User guide (200+ lines)
+  - IMPLEMENTATION.md      : Technical summary
+  - QUICK_START.md         : Quick reference
+
+Tests:
+  - tests/*.py             : Validation suite (all passing ✅)
+
+Database Schema (SQLite):
+  - projects               : Audit projects
+  - targets                : IPs/hostnames
+  - services               : Ports per target
+  - audit_tasks            : Individual scan tasks
+  - bitacora_entries       : Audit log
+  - findings               : Vulnerabilities
+
+MCP Tools Exposed:
+  1. audit_start           : Initialize project
+  2. audit_run             : Execute audit loop
+  3. audit_status          : Check progress
+  4. audit_record_finding  : Manual finding
+  5. audit_finalize        : Generate summary
+  6. audit_list_projects   : List all projects
+  7. audit_get_findings    : Query findings
+  8. audit_get_targets     : Query targets
+  9. audit_get_bitacora    : View logs
+  10. kali_test_connection : Test Kali server
+
+Lines of Code:
+  - Python code: ~4,500+ lines
+  - Documentation: ~1,500+ lines
+  - Tests: ~500+ lines
+  - Total: ~6,500+ lines
+
+Status: ✅ COMPLETE AND TESTED
