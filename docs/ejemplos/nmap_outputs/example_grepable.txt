@@ -1,0 +1,4 @@
+# Nmap 7.94 scan initiated
+Host: 10.19.220.23 ()	Status: Up
+Host: 10.19.220.23 ()	Ports: 22/open/tcp//ssh//OpenSSH 7.4/, 80/open/tcp//http//nginx 1.18.0/, 443/open/tcp//ssl|http//nginx 1.18.0/	Ignored State: filtered (997)
+# Nmap done at

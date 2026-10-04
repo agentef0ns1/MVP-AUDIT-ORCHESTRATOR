@@ -1,0 +1,8 @@
+Starting Nmap 7.94 ( https://nmap.org )
+Nmap scan report for 10.19.220.23
+Host is up (0.01s latency).
+PORT     STATE SERVICE        VERSION
+22/tcp   open  ssh            OpenSSH 7.4
+80/tcp   open  http           nginx 1.18.0
+8088/tcp open  ssl/radan-http myServer
+Nmap done: 1 IP address (1 host up) scanned

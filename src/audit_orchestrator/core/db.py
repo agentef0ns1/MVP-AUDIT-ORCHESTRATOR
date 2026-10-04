@@ -14,7 +14,7 @@ from typing import Any, Generator, Optional
 class Database:
     """SQLite database manager"""
     
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -78,6 +78,13 @@ class Database:
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
                 (2, datetime.utcnow().isoformat())
             )
+
+        if from_version < 3:
+            self._migrate_to_v3(conn)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (3, datetime.utcnow().isoformat())
+            )
     
     def _create_initial_schema(self, conn: sqlite3.Connection) -> None:
         """Create initial database schema"""
@@ -123,6 +130,7 @@ class Database:
                 port INTEGER NOT NULL,
                 protocol TEXT NOT NULL,
                 service_name TEXT,
+                version TEXT,
                 status TEXT NOT NULL,
                 max_time_seconds INTEGER NOT NULL,
                 started_at TEXT,
@@ -242,6 +250,13 @@ class Database:
             
             conn.execute("CREATE INDEX idx_llm_state_project ON llm_execution_state(project_id)")
             conn.execute("CREATE INDEX idx_llm_state_target ON llm_execution_state(target_id)")
+
+    def _migrate_to_v3(self, conn: sqlite3.Connection) -> None:
+        """Add optional service version captured from nmap -sV output."""
+        cursor = conn.execute("PRAGMA table_info(services)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "version" not in columns:
+            conn.execute("ALTER TABLE services ADD COLUMN version TEXT")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

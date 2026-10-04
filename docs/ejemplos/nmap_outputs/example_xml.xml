@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="10.19.220.23" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="22">
+        <state state="open"/>
+        <service name="ssh" product="OpenSSH" version="7.4"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+        <service name="http" product="nginx" version="1.18.0" tunnel="ssl"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>

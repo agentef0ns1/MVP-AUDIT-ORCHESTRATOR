@@ -47,7 +47,8 @@ Sistema de auditoría de seguridad automatizada con tres modos de ejecución: de
 
 **Tools Expuestos**:
 - `audit_start()` - Iniciar proyecto
-- `audit_run()` - Ejecutar auditoría
+- `audit_run()` - Ejecutar auditoría (con soporte paralelo desde v0.3.0)
+- `audit_review()` - Revisar auditorías y detectar fallos (v0.3.0)
 - `audit_status()` - Estado del proyecto
 - `audit_get_findings()` - Obtener hallazgos
 - `audit_llm_analyze_host()` - Contexto para análisis LLM (Type 2)
@@ -61,8 +62,11 @@ Sistema de auditoría de seguridad automatizada con tres modos de ejecución: de
 
 **Métodos Clave**:
 - `start_audit()` - Parsear input, crear proyecto, estructura de directorios
-- `run_audit()` - Loop principal de auditoría
+- `run_audit()` - Loop principal de auditoría (secuencial, legacy)
+- `run_audit_parallel()` - Loop paralelo con concurrencia controlada (v0.3.0)
 - `_audit_target()` - Dispatcher por execution_mode
+- `_audit_target_with_semaphore()` - Wrapper para ejecución paralela (v0.3.0)
+- `_aggregate_results()` - Agregación de resultados paralelos (v0.3.0)
 - `_audit_target_type1()` - Ejecución determinista
 - `_audit_target_type2()` - Ejecución con análisis LLM post-host
 - `_audit_target_type3()` - Ejecución con control total LLM
@@ -112,14 +116,37 @@ crear proyecto → por cada target:
 
 **Tablas**:
 - `projects` - Proyectos de auditoría (incluye `execution_mode`)
-- `targets` - Hosts/IPs a auditar
+- `targets` - Hosts/IPs a auditar (con `status`: pending, auditing, completed, failed)
 - `services` - Puertos por target
 - `audit_tasks` - Tareas ejecutadas
 - `bitacora_entries` - Log de operaciones
 - `findings` - Vulnerabilidades detectadas
 - `llm_execution_state` - Estado ejecución Type 3
 
-### 5. Kali MCP Client (`core/kali_client.py`)
+**Métodos Clave (v0.3.0)**:
+- `get_all_pending_targets()` - Obtener todos los targets pendientes (para ejecución paralela)
+
+### 5. Audit Reviewer (`core/audit_reviewer.py`) - v0.3.0
+
+**Responsabilidad**: Sistema de revisión y reconciliación de auditorías.
+
+**Funciones**:
+- `review_project()` - Revisar todos los targets de un proyecto
+- `_is_target_failed()` - Detectar auditorías fallidas basándose en criterios
+- `_generate_services_report()` - Generar reporte agrupado por servicios
+
+**Criterios de Detección de Fallos**:
+1. No existe directorio bitacora
+2. Bitacora vacía (sin archivos o archivos vacíos)
+3. >80% de líneas contienen errores (connection refused, timeout, unreachable, etc.)
+4. Todos los outputs de enumeración están vacíos (< 100 bytes)
+
+**Outputs**:
+- Lista de targets fallidos con razones
+- Re-encolado automático (reset a estado "pending")
+- `SERVICES_REPORT.md` - Reporte markdown agrupando targets por servicios
+
+### 6. Kali MCP Client (`core/kali_client.py`)
 
 **Responsabilidad**: Wrapper para ejecutar comandos en Kali Server.
 
@@ -127,6 +154,7 @@ crear proyecto → por cada target:
 - `execute()` - Ejecutar comando con timeout
 - Manejo de errores y reintentos
 - Mapeo de respuesta del servidor
+- Soporte concurrencia nativa con `httpx.AsyncClient` (v0.3.0)
 
 ### 6. Parser (`core/parser.py`)
 
@@ -271,6 +299,80 @@ Store: actualiza llm_execution_state
 - Máxima adaptabilidad
 - LLM decide cada paso
 - Límites estrictos de seguridad
+
+## Ejecución Paralela (v0.3.0)
+
+### Arquitectura
+
+```
+Entrada: Lista de targets pendientes
+ ↓
+Orchestrator.run_audit_parallel(max_concurrent=10)
+ ↓
+Semaphore(10) - Límite de concurrencia
+ ↓
+asyncio.gather(*tasks) - Ejecutar en paralelo
+ ↓
+[Task 1] [Task 2] [Task 3] ... [Task N]
+   ↓        ↓        ↓           ↓
+Kali MCP Client (httpx.AsyncClient)
+   ↓        ↓        ↓           ↓
+Kali Server (procesa múltiples requests concurrentes)
+ ↓
+Aggregate Results - Sumar completed/failed
+ ↓
+Return: {targets_processed, duration, parallel: true}
+```
+
+### Componentes
+
+**1. `run_audit_parallel()`**:
+- Obtiene todos los targets pendientes con `get_all_pending_targets()`
+- Crea `asyncio.Semaphore(max_concurrent)` para control de concurrencia
+- Genera tasks para cada target con `_audit_target_with_semaphore()`
+- Ejecuta con `asyncio.gather(*tasks, return_exceptions=True)`
+- Agrega resultados con `_aggregate_results()`
+
+**2. `_audit_target_with_semaphore()`**:
+- Adquiere semaphore antes de ejecutar
+- Llama a `_audit_target()` (lógica existente)
+- Actualiza estado del target (auditing → completed/failed)
+- Captura excepciones sin bloquear otros targets
+
+**3. Auto-review (opcional, default ON)**:
+- Ejecuta `AuditReviewer.review_project()` antes de empezar
+- Detecta targets fallidos previamente
+- Re-encola automáticamente targets con fallos
+- Genera `SERVICES_REPORT.md` al final
+
+### Flujo Completo
+
+```
+1. audit_run(project_id, parallel=true, max_concurrent=10)
+   ↓
+2. [Auto-review] AuditReviewer.review_project()
+   ↓
+3. Re-encolar targets fallidos (reset a "pending")
+   ↓
+4. get_all_pending_targets() → [t1, t2, ..., tN]
+   ↓
+5. Crear N tasks con semaphore(10)
+   ↓
+6. Ejecutar hasta 10 targets en paralelo
+   ↓
+7. Cada target completa → libera semaphore → siguiente target inicia
+   ↓
+8. Agregar resultados finales
+   ↓
+9. Return: duration, completed, failed, etc.
+```
+
+### Ventajas
+
+- **10-20x más rápido** que ejecución secuencial
+- **Resiliente**: Si un target falla, los demás continúan
+- **Configurable**: Ajusta `max_concurrent` según recursos
+- **Auto-recuperación**: Detecta y re-encola fallos automáticamente
 
 ## Seguridad
 

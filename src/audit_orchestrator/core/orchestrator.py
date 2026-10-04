@@ -21,6 +21,7 @@ from audit_orchestrator.core.parser import (
     parse_nmap_output,
     validate_targets,
 )
+from audit_orchestrator.core.live_screen import LiveScreen
 from audit_orchestrator.core.store import AuditStore
 from audit_orchestrator.core.tool_installer import (
     extract_tool_name,
@@ -95,10 +96,72 @@ class AuditProfile:
 class AuditOrchestrator:
     """Main orchestrator for security audits"""
     
-    def __init__(self, settings: Settings, store: AuditStore):
+    def __init__(
+        self,
+        settings: Settings,
+        store: AuditStore,
+        live: LiveScreen | None = None,
+    ):
         self.settings = settings
         self.store = store
+        self.live = live
         KaliClientFactory.configure(settings.kali_server_url)
+
+    def _live(self, *, force: bool = False, **fields: Any) -> None:
+        """Refresh the side-channel screen. Failures never stop the audit."""
+        if self.live is None:
+            return
+        try:
+            self.live.update(force=force, **fields)
+        except Exception:
+            return
+
+    def _close_run(
+        self,
+        project_id: str,
+        targets_processed: int,
+        targets_completed: int,
+        targets_failed: int,
+        findings_created: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Mark the project finished only when nothing is left pending."""
+        stats = self.store.get_project_statistics(project_id)
+        by_status = stats["targets_by_status"]
+        awaiting_llm = by_status.get("pending_llm_analysis", 0)
+        pending = by_status.get("pending", 0)
+        pending += by_status.get("auditing", 0)
+        pending += awaiting_llm
+        if awaiting_llm:
+            status = "pending_llm_analysis"
+            last = f"{awaiting_llm} targets awaiting LLM analysis"
+        elif pending == 0 and targets_failed == 0 and targets_processed > 0:
+            self.store.update_project_status(project_id, "completed")
+            status = "completed"
+            last = "audit finished"
+        elif pending:
+            status = "partial"
+            last = f"{pending} targets still pending"
+        elif targets_failed:
+            status = "failed"
+            last = f"{targets_failed} targets failed"
+        else:
+            status = "completed"
+            last = "audit finished"
+        self._live(
+            force=True,
+            phase="DONE",
+            service="-",
+            command="-",
+            mcp="audit_run",
+            llm="idle",
+            status=status,
+            last=last,
+            progress=(
+                f"done {targets_completed} pending {pending} "
+                f"fail {targets_failed} findings {findings_created}"
+            ),
+        )
+        return status, stats
     
     async def start_audit(
         self,
@@ -198,6 +261,7 @@ class AuditOrchestrator:
                     port=port_info["port"],
                     protocol=port_info.get("protocol", "tcp"),
                     service_name=port_info.get("service"),
+                    version=port_info.get("version"),
                     max_time_seconds=self.settings.max_time_per_service
                 )
                 service_count += 1
@@ -250,6 +314,18 @@ class AuditOrchestrator:
         
         # Create workspace manager
         workspace = WorkspaceManager(base_path)
+
+        self._live(
+            phase="PROCESS",
+            mcp="audit_run",
+            llm="idle",
+            asset="-",
+            service="-",
+            command="-",
+            status="starting",
+            last=f"profile {profile_name}",
+            progress="targets 0",
+        )
         
         # Initialize counters
         targets_processed = 0
@@ -257,6 +333,7 @@ class AuditOrchestrator:
         targets_failed = 0
         services_audited = 0
         findings_created = 0
+        pending_llm: list[dict[str, Any]] = []
         
         # Process targets sequentially
         async with KaliClientFactory.create() as kali_client:
@@ -273,6 +350,16 @@ class AuditOrchestrator:
                 
                 target_id = target["target_id"]
                 target_name = target["ip_or_hostname"]
+
+                self._live(
+                    phase="PROCESS",
+                    asset=target_name,
+                    service="-",
+                    status="auditing",
+                    mcp="audit_run",
+                    last=f"target {target_name}",
+                    progress=f"targets {targets_processed + 1}",
+                )
                 
                 # Update target status
                 self.store.update_target_status(target_id, "auditing")
@@ -290,10 +377,38 @@ class AuditOrchestrator:
                     
                     services_audited += result["services_audited"]
                     findings_created += result["findings_created"]
-                    
+
+                    if result.get("requires_llm_analysis"):
+                        self.store.update_target_status(target_id, "pending_llm_analysis")
+                        pending_llm.append({
+                            "project_id": project_id,
+                            "target_id": target_id,
+                            "target_name": target_name,
+                            "host_context": result.get("host_context"),
+                        })
+                        self._live(
+                            phase="LLM",
+                            asset=target_name,
+                            status="waiting",
+                            llm="pending analysis",
+                            last="enumeration done, awaiting LLM",
+                        )
+                        continue
+
                     # Mark target as completed
                     self.store.update_target_status(target_id, "completed")
                     targets_completed += 1
+                    self._live(
+                        phase="PROCESS",
+                        asset=target_name,
+                        status="completed",
+                        last=f"target done findings {result['findings_created']}",
+                        progress=(
+                            f"targets {targets_completed} ok"
+                            f" {targets_failed} fail"
+                            f" findings {findings_created}"
+                        ),
+                    )
                     
                     self.store.log_bitacora(
                         project_id=project_id,
@@ -312,6 +427,13 @@ class AuditOrchestrator:
                         error=str(e)
                     )
                     targets_failed += 1
+                    self._live(
+                        phase="PROCESS",
+                        asset=target_name,
+                        status="failed",
+                        last=str(e)[:80],
+                        progress=f"targets {targets_completed} ok {targets_failed} fail",
+                    )
                     
                     self.store.log_bitacora(
                         project_id=project_id,
@@ -321,22 +443,323 @@ class AuditOrchestrator:
                         notes=str(e)
                     )
         
-        # Update project status
-        if targets_failed == 0 and targets_processed > 0:
-            self.store.update_project_status(project_id, "completed")
-        
-        # Get statistics
-        stats = self.store.get_project_statistics(project_id)
+        status, stats = self._close_run(
+            project_id,
+            targets_processed,
+            targets_completed,
+            targets_failed,
+            findings_created,
+        )
         
         return {
-            "done": True,
+            "done": status == "completed",
+            "status": status,
             "project_id": project_id,
             "targets_processed": targets_processed,
             "targets_completed": targets_completed,
             "targets_failed": targets_failed,
             "services_audited": services_audited,
             "findings_created": findings_created,
+            "pending_llm": pending_llm,
             "statistics": stats
+        }
+    
+    async def run_audit_parallel(
+        self,
+        project_id: str,
+        max_targets: Optional[int] = None,
+        max_concurrent: int = 10,
+        auto_review: bool = True
+    ) -> dict[str, Any]:
+        """
+        Run audit with concurrent target processing.
+        
+        Args:
+            project_id: Project ID
+            max_targets: Max targets to process (None = all)
+            max_concurrent: Max concurrent targets (default: 10)
+            auto_review: Run auto-review before starting (default: True)
+        
+        Returns:
+            Summary of audit execution with parallel stats
+        """
+        import time
+        start_time = time.time()
+        
+        # Get project
+        project = self.store.get_project(project_id)
+        base_path = Path(project["base_path"])
+        profile_name = project["profile"]
+        
+        # Load audit profile
+        profile = self._load_profile(profile_name)
+        
+        # Create workspace manager
+        workspace = WorkspaceManager(base_path)
+
+        self._live(
+            phase="PROCESS",
+            mcp="audit_run",
+            llm="idle",
+            asset="-",
+            service="-",
+            command="-",
+            status="starting",
+            last=f"parallel profile {profile_name}",
+            progress=f"concurrency {max_concurrent}",
+        )
+        
+        # Auto-review before starting (if enabled)
+        re_enqueued = 0
+        if auto_review:
+            try:
+                from audit_orchestrator.core.audit_reviewer import AuditReviewer
+                reviewer = AuditReviewer(base_path, self.store)
+                review_result = reviewer.review_project(project_id)
+                re_enqueued = review_result.get("re_enqueued", 0)
+                
+                self.store.log_bitacora(
+                    project_id=project_id,
+                    operation="Auto-review completed",
+                    result="info",
+                    notes=f"Re-enqueued {re_enqueued} failed targets"
+                )
+                
+                # Save report to workspace
+                if review_result.get("report"):
+                    report_path = base_path / "SERVICES_REPORT.md"
+                    report_path.write_text(review_result["report"], encoding="utf-8")
+            except Exception as e:
+                # Log but don't fail if review fails
+                self.store.log_bitacora(
+                    project_id=project_id,
+                    operation="Auto-review failed",
+                    result="warning",
+                    notes=f"Error: {e}"
+                )
+        
+        # Get all pending targets
+        pending_targets = self.store.get_all_pending_targets(project_id)
+        
+        if not pending_targets:
+            stats = self.store.get_project_statistics(project_id)
+            return {
+                "done": True,
+                "project_id": project_id,
+                "targets_processed": 0,
+                "targets_completed": 0,
+                "targets_failed": 0,
+                "services_audited": 0,
+                "findings_created": 0,
+                "re_enqueued": re_enqueued,
+                "statistics": stats,
+                "duration": time.time() - start_time,
+                "parallel": True,
+                "max_concurrent": max_concurrent
+            }
+        
+        # Limit targets if specified
+        targets_to_process = pending_targets[:max_targets] if max_targets else pending_targets
+        
+        self.store.log_bitacora(
+            project_id=project_id,
+            operation=f"Starting parallel audit with {len(targets_to_process)} targets",
+            result="info",
+            notes=f"Concurrency: {max_concurrent}, Auto-review: {auto_review}, Re-enqueued: {re_enqueued}"
+        )
+        
+        # Create semaphore for concurrency limit
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Process targets in parallel with limit
+        async with KaliClientFactory.create() as kali_client:
+            tasks = [
+                self._audit_target_with_semaphore(
+                    semaphore, project_id, target, profile, workspace, kali_client
+                )
+                for target in targets_to_process
+            ]
+            
+            # Wait for all tasks
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Aggregate results
+        aggregated = self._aggregate_results(results)
+        
+        status, stats = self._close_run(
+            project_id,
+            aggregated["targets_processed"],
+            aggregated["targets_completed"],
+            aggregated["targets_failed"],
+            aggregated["findings_created"],
+        )
+        
+        duration = time.time() - start_time
+        
+        self.store.log_bitacora(
+            project_id=project_id,
+            operation="Parallel audit completed",
+            result="success",
+            notes=f"Processed {aggregated['targets_processed']} targets in {duration:.1f}s, "
+                  f"Completed: {aggregated['targets_completed']}, Failed: {aggregated['targets_failed']}"
+        )
+        
+        return {
+            "done": status == "completed",
+            "status": status,
+            "project_id": project_id,
+            "targets_processed": aggregated["targets_processed"],
+            "targets_completed": aggregated["targets_completed"],
+            "targets_failed": aggregated["targets_failed"],
+            "services_audited": aggregated["services_audited"],
+            "findings_created": aggregated["findings_created"],
+            "pending_llm": [
+                {**item, "project_id": project_id}
+                for item in aggregated.get("pending_llm", [])
+            ],
+            "re_enqueued": re_enqueued,
+            "statistics": stats,
+            "duration": duration,
+            "parallel": True,
+            "max_concurrent": max_concurrent
+        }
+    
+    async def _audit_target_with_semaphore(
+        self,
+        semaphore: asyncio.Semaphore,
+        project_id: str,
+        target: dict[str, Any],
+        profile: AuditProfile,
+        workspace: WorkspaceManager,
+        kali_client: KaliMCPClient
+    ) -> dict[str, Any]:
+        """Audit single target with semaphore control"""
+        async with semaphore:
+            target_id = target["target_id"]
+            target_name = target["ip_or_hostname"]
+
+            self._live(
+                phase="PROCESS",
+                asset=target_name,
+                service="-",
+                status="auditing",
+                mcp="audit_run",
+                last=f"target {target_name}",
+            )
+            
+            self.store.update_target_status(target_id, "auditing")
+            
+            try:
+                result = await self._audit_target(
+                    project_id, target, profile, workspace, kali_client
+                )
+                if result.get("requires_llm_analysis"):
+                    self.store.update_target_status(target_id, "pending_llm_analysis")
+                    self._live(
+                        phase="LLM",
+                        asset=target_name,
+                        status="waiting",
+                        llm="pending analysis",
+                        last="enumeration done, awaiting LLM",
+                    )
+                    return {
+                        "success": True,
+                        "requires_llm_analysis": True,
+                        "target": target_name,
+                        "target_id": target_id,
+                        "host_context": result.get("host_context"),
+                        "services_audited": result.get("services_audited", 0),
+                        "findings_created": result.get("findings_created", 0),
+                    }
+
+                self.store.update_target_status(target_id, "completed")
+                self._live(
+                    phase="PROCESS",
+                    asset=target_name,
+                    status="completed",
+                    last=f"findings {result.get('findings_created', 0)}",
+                )
+                
+                self.store.log_bitacora(
+                    project_id=project_id,
+                    target_id=target_id,
+                    operation=f"Target audit completed: {target_name}",
+                    result="success",
+                    notes=f"Services: {result.get('services_audited', 0)}, Findings: {result.get('findings_created', 0)}"
+                )
+                
+                return {
+                    "success": True,
+                    "target": target_name,
+                    "target_id": target_id,
+                    "services_audited": result.get("services_audited", 0),
+                    "findings_created": result.get("findings_created", 0)
+                }
+            
+            except Exception as e:
+                self.store.update_target_status(target_id, "failed", error=str(e))
+                self._live(
+                    phase="PROCESS",
+                    asset=target_name,
+                    status="failed",
+                    last=str(e)[:80],
+                )
+                
+                self.store.log_bitacora(
+                    project_id=project_id,
+                    target_id=target_id,
+                    operation=f"Target audit failed: {target_name}",
+                    result="error",
+                    notes=str(e)
+                )
+                
+                return {
+                    "success": False,
+                    "target": target_name,
+                    "target_id": target_id,
+                    "error": str(e),
+                    "services_audited": 0,
+                    "findings_created": 0
+                }
+    
+    def _aggregate_results(self, results: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate results from parallel execution"""
+        targets_processed = 0
+        targets_completed = 0
+        targets_failed = 0
+        services_audited = 0
+        findings_created = 0
+        pending_llm: list[dict[str, Any]] = []
+        
+        for result in results:
+            # Handle exceptions
+            if isinstance(result, Exception):
+                targets_failed += 1
+                continue
+            
+            targets_processed += 1
+            
+            if result.get("requires_llm_analysis"):
+                pending_llm.append({
+                    "target_id": result.get("target_id"),
+                    "target_name": result.get("target"),
+                    "host_context": result.get("host_context"),
+                })
+            elif result.get("success"):
+                targets_completed += 1
+            else:
+                targets_failed += 1
+            
+            services_audited += result.get("services_audited", 0)
+            findings_created += result.get("findings_created", 0)
+        
+        return {
+            "targets_processed": targets_processed,
+            "targets_completed": targets_completed,
+            "targets_failed": targets_failed,
+            "services_audited": services_audited,
+            "findings_created": findings_created,
+            "pending_llm": pending_llm,
         }
     
     async def _audit_target(
@@ -511,6 +934,14 @@ class AuditOrchestrator:
         # Phase 2: Build context and mark for LLM analysis
         host_context = self._build_host_context(project_id, target_id)
         
+        self._live(
+            phase="LLM",
+            asset=target_name,
+            llm="pending analysis",
+            mcp="audit_llm_analyze_host",
+            status="waiting",
+            last=f"{len(services)} services scanned",
+        )
         self.store.log_bitacora(
             project_id=project_id,
             target_id=target_id,
@@ -530,6 +961,8 @@ class AuditOrchestrator:
             "services_audited": services_audited,
             "findings_created": findings_created,
             "requires_llm_analysis": True,
+            "target_id": target_id,
+            "target_name": target_name,
             "host_context": host_context
         }
     
@@ -561,9 +994,24 @@ class AuditOrchestrator:
             ports = ",".join(str(s["port"]) for s in services)
             bootstrap_cmd = f"nmap -sV -p {ports} {target_name}"
             
+            self._live(
+                phase="LLM",
+                asset=target_name,
+                llm="bootstrap",
+                mcp="kali POST /api/command",
+                command=bootstrap_cmd,
+                status="running",
+            )
             try:
                 result = await kali_client.execute(bootstrap_cmd, timeout=300)
                 bootstrap_output = result.get("stdout", "")
+                self._live(
+                    phase="LLM",
+                    asset=target_name,
+                    status="done",
+                    last="bootstrap nmap finished",
+                    llm="control",
+                )
                 
                 # Update execution state
                 self.store.update_llm_execution_state(
@@ -617,7 +1065,7 @@ class AuditOrchestrator:
         """Build complete host context for LLM analysis"""
         target = self.store.get_target(target_id)
         services = self.store.get_services_by_target(target_id)
-        tasks = self.store.get_tasks_by_target(target_id)
+        tasks = self._attach_output_excerpts(self.store.get_tasks_by_target(target_id))
         findings = self.store.get_findings_by_target(target_id)
         bitacora = self.store.get_bitacora_by_target(target_id)
         
@@ -635,6 +1083,27 @@ class AuditOrchestrator:
                 "failed_tasks": sum(1 for t in tasks if t.get("status") == "failed")
             }
         }
+
+    def _attach_output_excerpts(
+        self,
+        tasks: list[dict[str, Any]],
+        limit: int = 4000,
+    ) -> list[dict[str, Any]]:
+        """Attach a short copy of each task output so the agent can read it."""
+        for task in tasks:
+            path = task.get("output_path")
+            if not path:
+                continue
+            output_file = Path(path)
+            if not output_file.is_file():
+                task["output_excerpt"] = f"(output file missing: {path})"
+                continue
+            try:
+                text = output_file.read_text(encoding="utf-8", errors="ignore")
+                task["output_excerpt"] = text[:limit]
+            except OSError as exc:
+                task["output_excerpt"] = f"(cannot read output: {exc})"
+        return tasks
     
     async def _detect_ssl_on_port(
         self,
@@ -704,6 +1173,16 @@ class AuditOrchestrator:
         service_name = service.get("service_name", "unknown")
         max_time = service["max_time_seconds"]
         
+        self._live(
+            phase="PROCESS",
+            asset=target_name,
+            service=f"{port}/{protocol} {service_name}",
+            status="running",
+            mcp="audit_run",
+            command="-",
+            last=f"service {port}/{protocol}",
+        )
+
         # Update service status
         self.store.update_service_status(service_id, "running")
         
@@ -753,6 +1232,14 @@ class AuditOrchestrator:
                 if has_ssl:
                     # Use HTTPS tasks instead
                     effective_service_name = "https"
+                    self._live(
+                        phase="ANALYSIS",
+                        asset=target_name,
+                        service=f"{port}/{protocol} https",
+                        mcp="kali POST /api/command",
+                        last=f"SSL detect {port} -> https",
+                        status="done",
+                    )
                     self.store.log_bitacora(
                         project_id=project_id,
                         target_id=target_id,
@@ -972,6 +1459,17 @@ class AuditOrchestrator:
             self.store.update_task_status(task_id, "running")
         except Exception:
             pass  # Don't fail if DB update fails
+
+        self._live(
+            phase="COMMAND",
+            asset=target_name,
+            service=f"{port}/{protocol} {service_name}",
+            mcp="kali POST /api/command",
+            command=command,
+            status="running",
+            llm="idle",
+            last=task_type,
+        )
         
         # Ensure tool is installed before execution
         try:
@@ -1063,9 +1561,28 @@ class AuditOrchestrator:
             except Exception:
                 pass  # Don't fail if logging fails
             
+            outcome = "done" if result.get("success") else "failed"
+            if result.get("timed_out"):
+                outcome = "timeout"
+            self._live(
+                phase="COMMAND",
+                asset=target_name,
+                service=f"{port}/{protocol} {service_name}",
+                mcp="kali POST /api/command",
+                command=command,
+                status=outcome,
+                last=f"{task_type} {outcome}",
+            )
             return result
         
         except Exception as e:
+            self._live(
+                phase="COMMAND",
+                asset=target_name,
+                status="failed",
+                command=command,
+                last=str(e)[:80],
+            )
             # Catch any unexpected exceptions
             try:
                 self.store.update_task_status(
@@ -1210,6 +1727,14 @@ class AuditOrchestrator:
             )
             
             finding_id = finding["finding_id"]
+            self._live(
+                phase="ANALYSIS",
+                asset=target_name,
+                service=f"{port}/{service_name}",
+                mcp="audit_run",
+                status="finding",
+                last=f"{finding_data['severity']} {finding_data['title']}"[:80],
+            )
             
             # Create finding file
             workspace.create_finding(

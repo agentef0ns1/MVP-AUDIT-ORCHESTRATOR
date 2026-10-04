@@ -10,8 +10,14 @@ from typing import Any
 from audit_orchestrator.mcp_compat import FastMCP
 from audit_orchestrator.config import Settings
 from audit_orchestrator.core.errors import AuditOrchestratorError
+from audit_orchestrator.core.live_screen import LiveScreen
 from audit_orchestrator.core.orchestrator import AuditOrchestrator
 from audit_orchestrator.core.store import AuditStore
+
+try:
+    from mcp.server.mcpserver import Context
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import Context  # type: ignore[no-redef]
 
 # Initialize MCP server
 mcp = FastMCP("audit-orchestrator")
@@ -53,6 +59,94 @@ def _err(code: str, message: str) -> str:
         "code": code,
         "message": message
     }, ensure_ascii=False)
+
+
+def _consume_task(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except Exception:
+        return
+
+
+def _make_live_sink(ctx: Context, pending: list[asyncio.Task]):
+    """Push a full screen frame as notifications/message on the server loop.
+
+    ctx.info() is dropped on protocol 2026-07-28 unless the client opts in
+    via _meta. send_notification does not apply that filter, so Cline receives
+    the frame while the tool is still running.
+    """
+
+    def sink(frame: str) -> None:
+        text = "```text\n" + frame + "\n```"
+
+        async def _send() -> None:
+            try:
+                import mcp.types as types
+                note = types.LoggingMessageNotification(
+                    params=types.LoggingMessageNotificationParams(
+                        level="info",
+                        data=text,
+                        logger="audit-live",
+                    )
+                )
+                await ctx.session.send_notification(
+                    note,
+                    related_request_id=ctx.request_id,
+                )
+            except Exception:
+                return
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_send())
+            pending.append(task)
+            task.add_done_callback(_consume_task)
+        except RuntimeError:
+            return
+
+    return sink
+
+
+def _bind_live(ctx: Context) -> LiveScreen:
+    pending: list[asyncio.Task] = []
+    screen = LiveScreen(sink=_make_live_sink(ctx, pending))
+    screen.notify_tasks = pending  # type: ignore[attr-defined]
+    get_orchestrator().live = screen
+    return screen
+
+
+async def _ok_live(data: dict[str, Any], screen: LiveScreen) -> str:
+    """Final tool text: last frame, then the same JSON as before."""
+    screen.publish(force=True)
+    pending = getattr(screen, "notify_tasks", [])
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return screen.message() + "\n\n" + _ok(data)
+
+
+def _compact_pending_llm(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Identifiers and service list only. Full outputs stay in audit_llm_analyze_host."""
+    compact: list[dict[str, Any]] = []
+    for item in items:
+        context = item.get("host_context") or {}
+        services = [
+            {
+                "port": service.get("port"),
+                "protocol": service.get("protocol"),
+                "service_name": service.get("service_name"),
+                "version": service.get("version"),
+                "status": service.get("status"),
+            }
+            for service in (context.get("services") or [])
+        ]
+        compact.append({
+            "project_id": item.get("project_id"),
+            "target_id": item.get("target_id"),
+            "target_name": item.get("target_name"),
+            "summary": context.get("summary") or {},
+            "services": services,
+        })
+    return compact
 
 
 def _handle(fn, *args, **kwargs) -> str:
@@ -110,9 +204,12 @@ def audit_start(
 
 
 @mcp.tool(structured_output=False)
-def audit_run(
+async def audit_run(
     project_id: str,
-    max_targets: int | None = None
+    max_targets: int | None = None,
+    parallel: bool = True,
+    max_concurrent: int = 10,
+    ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
     Run the audit orchestration loop.
@@ -122,36 +219,149 @@ def audit_run(
     tasks fail.
     
     The loop will:
-    - Process targets sequentially
+    - Process targets (sequentially or in parallel based on 'parallel' parameter)
     - Execute service-specific audit tasks
     - Respect 15-minute timeout per service
     - Automatically detect common vulnerabilities
     - Log all operations to bitacora
     - Continue on errors without stopping
+    - Auto-review before starting (if parallel mode enabled)
     
     Args:
         project_id: Project ID from audit_start
         max_targets: Optional limit on targets to process (for testing)
+        parallel: Enable parallel execution (default: True). Set False for legacy sequential mode
+        max_concurrent: Max concurrent targets when parallel=True (default: 10)
     
     Returns:
         JSON with execution summary, statistics, and done status
+    
+    Examples:
+        # Parallel execution (recommended)
+        audit_run(project_id="abc-123", parallel=True, max_concurrent=10)
+        
+        # Sequential execution (legacy)
+        audit_run(project_id="abc-123", parallel=False)
+        
+        # High concurrency
+        audit_run(project_id="abc-123", parallel=True, max_concurrent=20)
     """
     orchestrator = get_orchestrator()
-    return _handle(
-        orchestrator.run_audit,
-        project_id=project_id,
-        max_targets=max_targets
-    )
+    screen = _bind_live(ctx) if ctx is not None else LiveScreen()
+    try:
+        if parallel:
+            result = await orchestrator.run_audit_parallel(
+                project_id=project_id,
+                max_targets=max_targets,
+                max_concurrent=max_concurrent,
+            )
+        else:
+            result = await orchestrator.run_audit(
+                project_id=project_id,
+                max_targets=max_targets,
+            )
+        return await _ok_live(result, screen)
+    except AuditOrchestratorError as e:
+        return _err(e.code, e.message)
+    except Exception as e:
+        return _err("internal_error", str(e))
+    finally:
+        orchestrator.live = None
 
 
 @mcp.tool(structured_output=False)
-def audit_start_and_run(
+def audit_review(
+    project_id: str,
+    re_enqueue_failed: bool = True
+) -> str:
+    """
+    Review project audits, detect failures, and generate services report.
+    
+    This tool analyzes completed audits to detect targets that failed due to
+    connectivity issues, empty outputs, or excessive errors. Failed targets
+    can be automatically re-enqueued for retry.
+    
+    Detection criteria for failed audits:
+    - No bitacora directory or files
+    - Empty bitacora logs
+    - More than 80% of log lines contain errors
+    - No enumeration outputs or all outputs are empty
+    
+    The tool also generates a comprehensive SERVICES_REPORT.md that groups
+    targets by detected services, showing completion status for each.
+    
+    Args:
+        project_id: Project ID to review
+        re_enqueue_failed: Reset failed targets to pending status (default: True)
+    
+    Returns:
+        JSON with:
+        - total_targets: Total number of targets
+        - failed_targets: List of detected failed targets with reasons
+        - re_enqueued: Number of targets reset to pending
+        - report_path: Path to generated SERVICES_REPORT.md
+        - report: Full markdown report content
+    
+    Examples:
+        # Review and re-enqueue failures
+        audit_review(project_id="abc-123", re_enqueue_failed=True)
+        
+        # Review only (no re-enqueue)
+        audit_review(project_id="abc-123", re_enqueue_failed=False)
+    """
+    from pathlib import Path
+    from audit_orchestrator.core.audit_reviewer import AuditReviewer
+    
+    orchestrator = get_orchestrator()
+    project = orchestrator.store.get_project(project_id)
+    base_path = Path(project["base_path"])
+    
+    reviewer = AuditReviewer(base_path, orchestrator.store)
+    
+    # Perform review
+    if re_enqueue_failed:
+        result = reviewer.review_project(project_id)
+    else:
+        # Review without re-enqueuing
+        targets = orchestrator.store.get_targets_by_project(project_id)
+        failed_targets = []
+        
+        for target in targets:
+            failure_reason = reviewer._is_target_failed(target)
+            if failure_reason:
+                failed_targets.append({
+                    "ip": target["ip_or_hostname"],
+                    "target_id": target["target_id"],
+                    "status": target["status"],
+                    "reason": failure_reason
+                })
+        
+        result = {
+            "total_targets": len(targets),
+            "failed_targets": failed_targets,
+            "re_enqueued": 0,
+            "report": reviewer._generate_services_report(project_id, targets)
+        }
+    
+    # Save report to workspace
+    report_path = base_path / "SERVICES_REPORT.md"
+    report_path.write_text(result["report"], encoding="utf-8")
+    result["report_path"] = str(report_path)
+    
+    return _ok(result)
+
+
+@mcp.tool(structured_output=False)
+async def audit_start_and_run(
     base_path: str,
     input_file: str = "open_ports.txt",
     profile: str = "default_blackbox",
     execution_mode: str = "type_1_no_llm",
     reset: bool = False,
-    max_targets: int | None = None
+    max_targets: int | None = None,
+    parallel: bool = True,
+    max_concurrent: int = 10,
+    ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
     Convenience tool: Start + Run audit in one call.
@@ -166,6 +376,8 @@ def audit_start_and_run(
         execution_mode: Execution mode (type_1_no_llm, type_2_post_host_llm, type_3_interactive_llm)
         reset: Reset existing workspace if True
         max_targets: Optional limit on targets to process
+        parallel: Enable parallel execution (default: True)
+        max_concurrent: Max concurrent targets when parallel=True (default: 10)
     
     Returns:
         JSON with:
@@ -174,21 +386,30 @@ def audit_start_and_run(
         - Execution results (targets_processed, findings_created)
         - Final status
     """
-    def _impl():
-        orch = get_orchestrator()
-        
-        # Step 1: Start audit
-        start_result = asyncio.run(orch.start_audit(
+    orch = get_orchestrator()
+    screen = _bind_live(ctx) if ctx is not None else LiveScreen()
+    try:
+        start_result = await orch.start_audit(
             base_path, input_file, profile, execution_mode, reset
-        ))
-        
+        )
         project_id = start_result["project_id"]
-        
-        # Step 2: Run audit
-        run_result = asyncio.run(orch.run_audit(project_id, max_targets))
-        
-        # Combine results
-        return {
+        if parallel:
+            run_result = await orch.run_audit_parallel(
+                project_id, max_targets, max_concurrent
+            )
+        else:
+            run_result = await orch.run_audit(project_id, max_targets)
+        pending_llm = _compact_pending_llm(run_result.get("pending_llm") or [])
+        status = run_result.get("status", "completed")
+        if pending_llm:
+            status = "pending_llm_analysis"
+        note = "Audit started and executed successfully. Results in: " + base_path
+        if pending_llm:
+            note = (
+                "Enumeration finished. Do not analyze this response in prose. "
+                "Follow next_action and stop after the tool calls."
+            )
+        payload = {
             "success": True,
             "project_id": project_id,
             "base_path": base_path,
@@ -203,18 +424,33 @@ def audit_start_and_run(
                 "services_audited": run_result.get("services_audited", 0),
                 "findings_created": run_result.get("findings_created", 0)
             },
-            "status": run_result.get("status", "completed"),
-            "note": "Audit started and executed successfully. Results in: " + base_path
+            "status": status,
+            "pending_llm": pending_llm,
+            "next_action": (
+                "Call audit_llm_analyze_host(project_id, target_id) once to get the service index. "
+                "Then call it again with port= for one service at a time and read only those files. "
+                "Do not write an analysis, do not list negative results, and do not invent CVE identifiers. "
+                "After each service, run at most one safe command with "
+                "audit_llm_execute_poc(project_id, target_id, command, reason), or skip it. "
+                "No DoS, no brute-force, no exploitation."
+            ) if pending_llm else None,
+            "note": note
         }
-    
-    return _handle(_impl)
+        return await _ok_live(payload, screen)
+    except AuditOrchestratorError as e:
+        return _err(e.code, e.message)
+    except Exception as e:
+        return _err("internal_error", str(e))
+    finally:
+        orch.live = None
 
 
 @mcp.tool(structured_output=False)
-def audit_resume(
+async def audit_resume(
     base_path: str,
     input_file: str = "open_ports.txt",
-    max_targets: int | None = None
+    max_targets: int | None = None,
+    ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
     Resume/continue audit from a directory without knowing project_id.
@@ -230,24 +466,19 @@ def audit_resume(
     Returns:
         JSON with execution results and status
     """
-    def _impl():
-        orch = get_orchestrator()
-        store = orch.store
-        
-        # Find project by path
+    orch = get_orchestrator()
+    screen = _bind_live(ctx) if ctx is not None else LiveScreen()
+    try:
         try:
-            project = store.get_project_by_path(base_path, input_file)
+            project = orch.store.get_project_by_path(base_path, input_file)
             project_id = project["project_id"]
-        except Exception as e:
+        except Exception:
             raise AuditOrchestratorError(
                 "project_not_found",
                 f"No audit project found at {base_path}. Use audit_start_and_run() to create one."
             )
-        
-        # Run audit
-        run_result = asyncio.run(orch.run_audit(project_id, max_targets))
-        
-        return {
+        run_result = await orch.run_audit(project_id, max_targets)
+        payload = {
             "success": True,
             "project_id": project_id,
             "base_path": base_path,
@@ -261,8 +492,13 @@ def audit_resume(
             "status": run_result.get("status", "completed"),
             "note": "Audit resumed and executed. Results in: " + base_path
         }
-    
-    return _handle(_impl)
+        return await _ok_live(payload, screen)
+    except AuditOrchestratorError as e:
+        return _err(e.code, e.message)
+    except Exception as e:
+        return _err("internal_error", str(e))
+    finally:
+        orch.live = None
 
 
 @mcp.tool(structured_output=False)
@@ -610,55 +846,97 @@ def kali_test_connection() -> str:
 @mcp.tool(structured_output=False)
 def audit_llm_analyze_host(
     project_id: str,
-    target_id: str
+    target_id: str,
+    port: int | None = None,
 ) -> str:
     """
-    [Type 2 Mode] Get complete host context for LLM analysis.
-    
-    Returns all enumeration results for a host after JSON tasks complete.
-    The LLM should analyze the outputs and propose safe PoC tests.
-    
-    Use this after audit_run completes for a target in Type 2 mode to get
-    all the data needed for analysis.
-    
+    [Type 2 Mode] Read enumeration results one service at a time.
+
+    Without port, returns the service index (ports and file names, no output).
+    With port, returns only that service's task outputs.
+
     Args:
         project_id: Project ID
         target_id: Target ID to analyze
-    
-    Returns:
-        JSON with host_context (target, services, tasks, findings, bitacora)
+        port: Service port. Omit it for the index; set it to read that service.
     """
     def _impl():
         orch = get_orchestrator()
-        
-        # Validate project and target exist
+
         project = orch.store.get_project(project_id)
         target = orch.store.get_target(target_id)
-        
-        # Check execution mode
+
         if project.get("execution_mode") != "type_2_post_host_llm":
             return {
                 "error": True,
                 "message": f"This tool is only for Type 2 mode. Project is in {project.get('execution_mode')} mode."
             }
-        
-        # Build context
-        context = orch._build_host_context(project_id, target_id)
-        
+
+        services = orch.store.get_services_by_target(target_id)
+        if port is None:
+            index = []
+            for service in services:
+                tasks = orch.store.get_tasks_by_service(service["service_id"])
+                index.append({
+                    "port": service.get("port"),
+                    "protocol": service.get("protocol"),
+                    "service_name": service.get("service_name"),
+                    "version": service.get("version"),
+                    "tasks": [
+                        {
+                            "task_type": task.get("task_type"),
+                            "status": task.get("status"),
+                            "output_path": task.get("output_path"),
+                        }
+                        for task in tasks
+                    ],
+                })
+            return {
+                "success": True,
+                "mode": "service_index",
+                "project_id": project_id,
+                "target_id": target_id,
+                "target_name": target.get("ip_or_hostname"),
+                "services": index,
+                "instructions": (
+                    "This is only the index. Do not analyze it and do not list CVEs. "
+                    "Call audit_llm_analyze_host again with port= for one service. "
+                    "Read those files, run at most one safe PoC with audit_llm_execute_poc "
+                    "or skip the service, then request the next port."
+                ),
+            }
+
+        selected = [service for service in services if service.get("port") == port]
+        if not selected:
+            return {
+                "error": True,
+                "message": f"No service on port {port} for this target.",
+            }
+        service = selected[0]
+        tasks = orch._attach_output_excerpts(
+            orch.store.get_tasks_by_service(service["service_id"])
+        )
         return {
             "success": True,
+            "mode": "service_files",
             "project_id": project_id,
             "target_id": target_id,
             "target_name": target.get("ip_or_hostname"),
-            "host_context": context,
+            "service": {
+                "port": service.get("port"),
+                "protocol": service.get("protocol"),
+                "service_name": service.get("service_name"),
+                "version": service.get("version"),
+            },
+            "tasks": tasks,
             "instructions": (
-                "Analyze the enumeration outputs. "
-                "Look for potential vulnerabilities, misconfigurations, and attack vectors. "
-                "Propose safe PoC tests (no DoS, no brute-force, no exploitation). "
-                "Use audit_llm_execute_poc to execute your proposed tests."
-            )
+                "These files belong only to this port. "
+                "Do not invent CVE identifiers and do not list checks that found nothing. "
+                "If a safe check is useful, call audit_llm_execute_poc once for this port. "
+                "Then call audit_llm_analyze_host with the next port."
+            ),
         }
-    
+
     return _handle(_impl)
 
 

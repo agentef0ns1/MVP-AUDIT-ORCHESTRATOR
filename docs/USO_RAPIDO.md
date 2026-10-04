@@ -23,7 +23,7 @@ Si necesitas más control:
 #### 1. Preparar Input
 
 ```bash
-# Escaneo directo
+# Escaneo directo (también vale -oG, -oX o un bucle for; ver docs/FORMATOS_NMAP.md)
 nmap -sV -p- 10.19.220.0/24 -oN open_ports.txt
 ```
 
@@ -60,6 +60,39 @@ audit_get_findings(project_id="abc-123-def-456")
 # Ver estado
 audit_status(project_id="abc-123-def-456")
 ```
+
+### Ejecución Paralela (v0.3.0) 🚀
+
+**10x más rápido procesando múltiples targets en paralelo:**
+
+```python
+# Método simple con paralelo (default)
+audit_start_and_run(
+    base_path="/tmp/mi_auditoria",
+    input_file="open_ports.txt",
+    parallel=true,
+    max_concurrent=10  # 10 targets en paralelo
+)
+
+# O con más concurrencia
+audit_run(
+    project_id="abc-123",
+    parallel=true,
+    max_concurrent=20  # 20 targets en paralelo
+)
+```
+
+**Revisar y re-encolar auditorías fallidas:**
+
+```python
+# Auto-detecta fallos y re-encola
+audit_review(
+    project_id="abc-123",
+    re_enqueue_failed=true
+)
+```
+
+Ver **[PARALLEL_EXECUTION.md](PARALLEL_EXECUTION.md)** para más detalles y 12 ejemplos completos.
 
 ### Continuar/Resumir Auditoría
 

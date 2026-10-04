@@ -1,0 +1,10 @@
+10.19.220.1
+22/tcp open ssh
+80/tcp open http
+
+10.19.220.2
+443/tcp open https
+3306/tcp open mysql
+
+10.19.220.3
+8080/tcp open http-proxy

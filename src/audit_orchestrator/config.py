@@ -38,6 +38,24 @@ class Settings:
         
         # Default audit profile
         self.default_profile = "default_blackbox"
+        
+        # Parallel execution settings
+        self.max_concurrent_targets = int(os.environ.get(
+            "AUDIT_MAX_CONCURRENT", 
+            "10"
+        ))
+        
+        # Auto-review before run
+        self.auto_review_on_run = os.environ.get(
+            "AUDIT_AUTO_REVIEW", 
+            "true"
+        ).lower() in ("true", "1", "yes")
+        
+        # Error threshold for failed target detection (0.8 = 80% error lines)
+        self.review_error_threshold = float(os.environ.get(
+            "AUDIT_ERROR_THRESHOLD",
+            "0.8"
+        ))
     
     @classmethod
     def from_args(

@@ -1,8 +1,8 @@
 # MVP Audit Orchestrator
 
-Sistema de auditoría de seguridad automatizada con integración LLM opcional.
+Sistema de auditoría de seguridad automatizada con integración LLM opcional y **ejecución paralela de targets**.
 
-**Versión actual**: 0.2.5 | **Última actualización**: 2026-10-02
+**Versión actual**: 0.3.0 | **Última actualización**: 2026-10-02
 
 ## 📚 Documentación
 
@@ -13,10 +13,13 @@ Sistema de auditoría de seguridad automatizada con integración LLM opcional.
 ### 📖 Documentación Completa
 - **[docs/](docs/)** - Índice completo de documentación
   - [INSTALACION.md](docs/INSTALACION.md) - Instalación y configuración
+  - [CONFIGURACION.md](docs/CONFIGURACION.md) - **Configuración (puerto Kali, concurrencia, etc.)** ⭐
   - [ARQUITECTURA.md](docs/ARQUITECTURA.md) - Arquitectura del sistema
+  - [PARALLEL_EXECUTION.md](docs/PARALLEL_EXECUTION.md) - **Ejecución paralela y sistema de revisión** ⭐ **NUEVO**
+  - [FORMATOS_NMAP.md](docs/FORMATOS_NMAP.md) - Entrada nmap: normal, grepable, XML y bucle for
   - [IMPLEMENTATION.md](docs/IMPLEMENTATION.md) - Detalles técnicos
   - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - Solución de problemas
-  - [CHANGELOG_v0.2.5.md](docs/CHANGELOG_v0.2.5.md) - Changelog última versión
+  - [CHANGELOG.md](docs/CHANGELOG.md) - Changelog completo
 
 ### 🛠️ Para Desarrolladores
 - **[dev-tools/](dev-tools/)** - Herramientas de desarrollo y testing
@@ -39,12 +42,24 @@ Editar `~/.cursor/mcp_servers.json`:
   "mcpServers": {
     "audit-orchestrator": {
       "command": "python3",
-      "args": ["-m", "audit_orchestrator.mcp_server", "--transport", "stdio"],
+      "args": [
+        "-m", "audit_orchestrator.mcp_server",
+        "--transport", "stdio",
+        "--kali-server-url", "http://127.0.0.1:5001"
+      ],
+      "env": {
+        "AUDIT_MAX_CONCURRENT": "10",
+        "AUDIT_AUTO_REVIEW": "true"
+      },
       "cwd": "/opt/cline-mcps/MVP-audit-orchestrator"
     }
   }
 }
 ```
+
+**Configuración del puerto Kali**:
+- Cambiar `--kali-server-url` para usar otro puerto u host
+- Ver [CONFIGURACION.md](docs/CONFIGURACION.md) para todas las opciones
 
 ### 3. Usar
 
@@ -68,6 +83,24 @@ audit_status_by_path(base_path="/tmp/audit")
 Ver **[docs/USO_RAPIDO.md](docs/USO_RAPIDO.md)** para más ejemplos.
 
 ## ✨ Características
+
+### 🚀 Ejecución Paralela (v0.3.0)
+
+- **10x más rápido**: Procesa múltiples targets simultáneamente
+- **Concurrencia configurable**: Ajusta `max_concurrent` según tu infraestructura (default: 10)
+- **Auto-review inteligente**: Detecta auditorías fallidas automáticamente
+- **Reportes por servicios**: Agrupa targets por HTTP, SSH, MySQL, etc.
+- **Re-encolado automático**: Vuelve a intentar targets que fallaron
+
+```python
+# Ejecutar con 15 targets en paralelo
+audit_run(project_id="abc-123", parallel=true, max_concurrent=15)
+
+# Revisar y re-encolar fallos
+audit_review(project_id="abc-123", re_enqueue_failed=true)
+```
+
+Ver **[docs/PARALLEL_EXECUTION.md](docs/PARALLEL_EXECUTION.md)** para más detalles.
 
 ### Tres Modos de Ejecución
 

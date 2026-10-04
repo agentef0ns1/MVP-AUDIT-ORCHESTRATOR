@@ -389,6 +389,24 @@ class AuditStore:
             data["ports"] = json_deserialize(data.get("ports_detected"))
             return data
     
+    def get_all_pending_targets(self, project_id: str) -> list[dict[str, Any]]:
+        """Get all pending targets for parallel processing"""
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                SELECT * FROM targets
+                WHERE project_id = ?
+                AND status = 'pending'
+                ORDER BY created_at
+            """, (project_id,))
+            
+            rows = cursor.fetchall()
+            targets = []
+            for row in rows:
+                data = row_to_dict(row)
+                data["ports"] = json_deserialize(data.get("ports_detected"))
+                targets.append(data)
+            return targets
+    
     # ===== Services =====
     
     def create_service(
@@ -397,7 +415,8 @@ class AuditStore:
         port: int,
         protocol: str,
         service_name: Optional[str] = None,
-        max_time_seconds: int = 900
+        max_time_seconds: int = 900,
+        version: Optional[str] = None
     ) -> dict[str, Any]:
         """Create a new service"""
         service_id = self._new_id()
@@ -406,11 +425,11 @@ class AuditStore:
             conn.execute("""
                 INSERT INTO services (
                     service_id, target_id, port, protocol, service_name,
-                    status, max_time_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    version, status, max_time_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 service_id, target_id, port, protocol, service_name,
-                "pending", max_time_seconds
+                version, "pending", max_time_seconds
             ))
         
         return {
@@ -419,6 +438,7 @@ class AuditStore:
             "port": port,
             "protocol": protocol,
             "service_name": service_name,
+            "version": version,
             "status": "pending",
             "max_time_seconds": max_time_seconds
         }
@@ -567,6 +587,17 @@ class AuditStore:
                 (service_id,)
             )
             return rows_to_list(cursor.fetchall())
+
+    def get_tasks_by_target(self, target_id: str) -> list[dict[str, Any]]:
+        """Get every audit task that belongs to a target."""
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                SELECT t.* FROM audit_tasks t
+                JOIN services s ON t.service_id = s.service_id
+                WHERE s.target_id = ?
+                ORDER BY t.started_at
+            """, (target_id,))
+            return rows_to_list(cursor.fetchall())
     
     # ===== Bitacora (Audit Log) =====
     
@@ -618,6 +649,17 @@ class AuditStore:
                     ORDER BY timestamp DESC LIMIT ?
                 """, (project_id, limit))
             
+            return rows_to_list(cursor.fetchall())
+
+    def get_bitacora_by_target(self, target_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Get bitacora entries for one target, oldest first."""
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                SELECT * FROM bitacora_entries
+                WHERE target_id = ?
+                ORDER BY timestamp ASC
+                LIMIT ?
+            """, (target_id, limit))
             return rows_to_list(cursor.fetchall())
     
     def get_last_bitacora_entry(self, project_id: str) -> Optional[dict[str, Any]]:
@@ -699,6 +741,16 @@ class AuditStore:
                     ORDER BY created_at DESC
                 """, (project_id,))
             
+            return rows_to_list(cursor.fetchall())
+
+    def get_findings_by_target(self, target_id: str) -> list[dict[str, Any]]:
+        """Get findings recorded for one target."""
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                SELECT * FROM findings
+                WHERE target_id = ?
+                ORDER BY created_at DESC
+            """, (target_id,))
             return rows_to_list(cursor.fetchall())
     
     def get_findings_count_by_severity(self, project_id: str) -> dict[str, int]:

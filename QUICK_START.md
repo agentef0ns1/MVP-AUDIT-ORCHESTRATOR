@@ -8,7 +8,25 @@ chmod +x scripts/install.sh
 ./scripts/install.sh
 ```
 
-## 2. Configure MCP Client
+## 2. Configure Kali Server URL (Optional)
+
+**Default**: `http://127.0.0.1:5001`
+
+If your Kali MCP server uses a different port or host:
+
+```bash
+export KALI_SERVER_URL="http://127.0.0.1:8080"
+```
+
+Or set permanently in `~/.bashrc`:
+```bash
+echo 'export KALI_SERVER_URL="http://kali-server:5001"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+📖 **Full config guide**: [CONFIGURAR_PUERTO_KALI.md](CONFIGURAR_PUERTO_KALI.md)
+
+## 3. Configure MCP Client
 
 **For Cline:**
 Edit `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
@@ -24,15 +42,19 @@ Add:
       "command": "/opt/cline-mcps/MVP-audit-orchestrator/.venv/bin/python",
       "args": [
         "-m", "audit_orchestrator.mcp_server",
+        "--kali-server-url", "http://127.0.0.1:5001",
         "--data-dir", "/home/f0ns1/.local/share/audit-orchestrator"
       ],
+      "env": {
+        "AUDIT_MAX_CONCURRENT": "10"
+      },
       "timeout": 3600
     }
   }
 }
 ```
 
-## 3. Verify MCP Kali is Running
+## 4. Verify MCP Kali is Running
 
 ```bash
 # Quick health check
@@ -50,7 +72,23 @@ If not running, start your MCP Kali server:
 kali-server-mcp --ip 0.0.0.0 --port 5001
 ```
 
-## 4. Run Your First Audit
+## 5. Prepare nmap input
+
+Any of these files can be the audit input. The parser picks the format automatically.
+
+```bash
+nmap -sV -p- --min-rate 5000 -v 10.19.220.0/24 -oN open_ports.txt
+
+# or several hosts concatenated
+for i in $(cat hosts.txt); do
+  echo "$i"
+  nmap -p- --min-rate 5000 -v "$i" | grep open
+done > open_ports.txt
+```
+
+See [docs/FORMATOS_NMAP.md](docs/FORMATOS_NMAP.md).
+
+## 6. Run Your First Audit
 
 ### Option A: Simple Prompt
 
@@ -85,7 +123,7 @@ Wait for completion (`done: true`).
 3. audit_finalize(project_id="<your-project-id>")
 ```
 
-## 5. Check Results
+## 7. Check Results
 
 ```bash
 cd /home/f0ns1/RedTeam/OCSR25/PoC/
@@ -103,7 +141,7 @@ cat 10.19.220.23/findings/INDICE.md
 cat 10.19.220.23/bitacora/audit_*.log
 ```
 
-## 6. Monitor Progress (Optional)
+## 8. Monitor Progress (Optional)
 
 While audit is running:
 ```
@@ -118,7 +156,9 @@ Returns:
 
 ## Input File Format
 
-Your `open_ports.txt` should look like:
+The parser accepts nmap normal (`-oN`), grepable (`-oG`), XML (`-oX`), and several scans concatenated from a `for` loop. Details: [docs/FORMATOS_NMAP.md](docs/FORMATOS_NMAP.md).
+
+A legacy plaintext file still works:
 
 ```
 10.19.220.23
