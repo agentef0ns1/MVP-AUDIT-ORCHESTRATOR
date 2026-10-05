@@ -28,6 +28,7 @@ from audit_orchestrator.core.tool_installer import (
     get_check_command,
     get_install_command,
 )
+from audit_orchestrator.core.command_normalizer import normalize_command
 
 
 class AuditProfile:
@@ -107,12 +108,21 @@ class AuditOrchestrator:
         self.live = live
         KaliClientFactory.configure(settings.kali_server_url)
 
-    def _live(self, *, force: bool = False, **fields: Any) -> None:
-        """Refresh the side-channel screen. Failures never stop the audit."""
+    def _attach_live_file(self, base_path: Path) -> None:
+        """Point the screen at the workspace frame file. Never opens a terminal."""
         if self.live is None:
             return
         try:
-            self.live.update(force=force, **fields)
+            self.live.frame_path = base_path / "audit-live.txt"
+        except Exception:
+            return
+
+    def _live(self, *, force: bool = False, solo: bool = False, **fields: Any) -> None:
+        """Refresh one asset box. Failures never stop the audit."""
+        if self.live is None:
+            return
+        try:
+            self.live.update(force=force, solo=solo, **fields)
         except Exception:
             return
 
@@ -149,7 +159,9 @@ class AuditOrchestrator:
             last = "audit finished"
         self._live(
             force=True,
+            solo=True,
             phase="DONE",
+            asset=f"{targets_completed} hosts",
             service="-",
             command="-",
             mcp="audit_run",
@@ -157,8 +169,8 @@ class AuditOrchestrator:
             status=status,
             last=last,
             progress=(
-                f"done {targets_completed} pending {pending} "
-                f"fail {targets_failed} findings {findings_created}"
+                f"hosts {targets_completed}   pending {pending}   "
+                f"fail {targets_failed}   findings {findings_created}"
             ),
         )
         return status, stats
@@ -314,6 +326,7 @@ class AuditOrchestrator:
         
         # Create workspace manager
         workspace = WorkspaceManager(base_path)
+        self._attach_live_file(base_path)
 
         self._live(
             phase="PROCESS",
@@ -496,6 +509,7 @@ class AuditOrchestrator:
         
         # Create workspace manager
         workspace = WorkspaceManager(base_path)
+        self._attach_live_file(base_path)
 
         self._live(
             phase="PROCESS",
@@ -1428,6 +1442,8 @@ class AuditOrchestrator:
                 port=port,
                 protocol=protocol
             )
+            # Normalize command to use absolute paths (prevents aliasing issues)
+            command = normalize_command(command)
         except Exception as e:
             # If command formatting fails, return error
             return {
@@ -1571,6 +1587,7 @@ class AuditOrchestrator:
                 mcp="kali POST /api/command",
                 command=command,
                 status=outcome,
+                output=result.get("output") or result.get("error") or "",
                 last=f"{task_type} {outcome}",
             )
             return result
