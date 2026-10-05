@@ -1123,31 +1123,93 @@ class AuditOrchestrator:
         self,
         target_name: str,
         port: int,
+        service_name: str,
         kali_client: KaliMCPClient,
         workspace: WorkspaceManager
     ) -> bool:
         """
         Detect if a port is serving SSL/TLS.
         
-        Uses openssl s_client to test SSL connectivity.
+        Strategy:
+        1. Use nmap service detection first (most reliable)
+        2. For common ports, use known defaults
+        3. For unknown ports, test with openssl
         
         Returns:
             True if SSL is detected, False otherwise
         """
         try:
-            # Test SSL connection with openssl
-            test_cmd = f"timeout 5 openssl s_client -connect {target_name}:{port} < /dev/null 2>&1 | grep -q 'Cipher'"
+            # Step 1: Check service name from nmap first (most reliable)
+            service_lower = service_name.lower() if service_name else ""
+            
+            # Explicit SSL indicators in service name
+            if any(indicator in service_lower for indicator in ["https", "ssl", "tls", "imaps", "pop3s", "smtps", "ftps"]):
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp ({service_name})",
+                    f"✓ SSL/TLS detected via service name '{service_name}' - using HTTPS",
+                    result="info"
+                )
+                return True
+            
+            # Explicit non-SSL indicators
+            if service_lower in ["http", "ftp", "smtp", "pop3", "imap", "telnet"]:
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp ({service_name})",
+                    f"✗ Non-SSL service '{service_name}' detected - using HTTP",
+                    result="info"
+                )
+                return False
+            
+            # Step 2: Known port defaults
+            if port == 443:
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp",
+                    "✓ Standard HTTPS port (443) - using HTTPS",
+                    result="info"
+                )
+                return True
+            elif port == 80:
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp",
+                    "✗ Standard HTTP port (80) - using HTTP",
+                    result="info"
+                )
+                return False
+            elif port in [8443, 9443, 10443]:  # Common alternate HTTPS ports
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp",
+                    f"✓ Common HTTPS port ({port}) - using HTTPS",
+                    result="info"
+                )
+                return True
+            elif port in [8080, 8000, 8008, 3000, 5000]:  # Common alternate HTTP ports
+                workspace.append_bitacora(
+                    target_name,
+                    f"SSL Detection on {port}/tcp",
+                    f"✗ Common HTTP port ({port}) - using HTTP",
+                    result="info"
+                )
+                return False
+            
+            # Step 3: For unknown ports, test with openssl
+            # Look for successful SSL handshake with actual cipher (not "(NONE)")
+            test_cmd = f"timeout 5 openssl s_client -connect {target_name}:{port} < /dev/null 2>&1 | grep 'Cipher' | grep -qv '(NONE)'"
             result = await kali_client.execute_command(
                 command=test_cmd,
                 timeout=10
             )
             
-            # If exit code is 0, SSL cipher was found
+            # If exit code is 0, a real SSL cipher was negotiated
             if result.get("exit_code") == 0:
                 workspace.append_bitacora(
                     target_name,
                     f"SSL Detection on {port}/tcp",
-                    "✓ SSL/TLS detected - using HTTPS",
+                    "✓ SSL/TLS detected via openssl test - using HTTPS",
                     result="info"
                 )
                 return True
@@ -1155,20 +1217,22 @@ class AuditOrchestrator:
                 workspace.append_bitacora(
                     target_name,
                     f"SSL Detection on {port}/tcp",
-                    "✗ No SSL/TLS - using HTTP",
+                    "✗ No SSL/TLS detected - using HTTP",
                     result="info"
                 )
                 return False
                 
         except Exception as e:
-            # On error, assume no SSL
+            # On error, default based on port
+            # Assume no SSL for most ports, yes SSL for 443
+            default_ssl = (port == 443)
             workspace.append_bitacora(
                 target_name,
                 f"SSL Detection on {port}/tcp",
-                f"Detection failed: {e} - defaulting to HTTP",
+                f"Detection failed: {e} - defaulting to {'HTTPS' if default_ssl else 'HTTP'}",
                 result="info"
             )
-            return False
+            return default_ssl
     
     async def _audit_service(
         self,
@@ -1240,7 +1304,7 @@ class AuditOrchestrator:
                 )
                 
                 has_ssl = await self._detect_ssl_on_port(
-                    target_name, port, kali_client, workspace
+                    target_name, port, service_name, kali_client, workspace
                 )
                 
                 if has_ssl:
