@@ -33,13 +33,18 @@
         "description": "Detect Web Application Firewall"
       },
       {
+        "type": "nuclei_scan",
+        "command": "nuclei -u http://{target}:{port} -t /home/kali/nuclei-templates/http -silent -no-color -disable-update-check -timeout 8 -retries 0 -rate-limit 40 -severity info,low,medium,high,critical -exclude-tags dos,fuzz,intrusive 2>&1 || true",
+        "description": "Nuclei HTTP templates for this web port"
+      },
+      {
         "type": "nikto",
         "command": "nikto -h http://{target}:{port} -Tuning 123bde -maxtime 4m",
         "description": "Web vulnerability scanner"
       },
       {
         "type": "web_fuzzing",
-        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
+        "command": "ffuf -s -noninteractive -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
         "description": "Directory and file fuzzing"
       },
       {
@@ -79,22 +84,22 @@
       },
       {
         "type": "param_fuzzing",
-        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -recursion -recursion-depth 2 -timeout 10 2>&1 || true",
+        "command": "ffuf -s -noninteractive -u http://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -recursion -recursion-depth 2 -timeout 10 2>&1 || true",
         "description": "Recursive directory fuzzing"
       },
       {
         "type": "param_discovery",
-        "command": "arjun -u http://{target}:{port}/ -oJ /tmp/params_{target}_{port}.json 2>&1 || true",
+        "command": "arjun -q -u http://{target}:{port}/ -oT /tmp/params_{target}_{port}.txt -oJ /tmp/params_{target}_{port}.json >/dev/null 2>&1; if [ -s /tmp/params_{target}_{port}.txt ]; then cat /tmp/params_{target}_{port}.txt; else echo 'No parameters were discovered.'; fi",
         "description": "Discover hidden GET/POST parameters"
       },
       {
         "type": "vhost_fuzzing",
-        "command": "ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u http://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 20 2>&1 || true",
+        "command": "ffuf -s -noninteractive -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u http://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 20 2>&1 || true",
         "description": "Virtual host discovery"
       },
       {
         "type": "api_endpoints_enum",
-        "command": "feroxbuster -u http://{target}:{port}/api -w /usr/share/wordlists/dirb/common.txt -x json,xml -t 50 -C 404 --timeout 10 2>&1 || true",
+        "command": "feroxbuster --silent -u http://{target}:{port}/api -w /usr/share/wordlists/dirb/common.txt -x json,xml -t 50 -C 404 --timeout 10 2>&1 || true",
         "description": "Enumerate API endpoints"
       },
       {
@@ -109,12 +114,12 @@
       },
       {
         "type": "api_fuzzing",
-        "command": "wfuzz -z file,/usr/share/seclists/Fuzzing/api-endpoints.txt http://{target}:{port}/api/FUZZ -hc 404 --hh BBB 2>&1 || true",
+        "command": "wfuzz -z file,/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt --hc 404 http://{target}:{port}/api/FUZZ 2>&1 || true",
         "description": "API endpoint fuzzing"
       },
       {
         "type": "backup_files",
-        "command": "ffuf -u http://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-small-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz -t 20 2>&1 || true",
+        "command": "ffuf -s -noninteractive -u http://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-small-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz -t 20 2>&1 || true",
         "description": "Search for backup files and archives"
       },
       {
@@ -220,8 +225,13 @@
         "description": "Detect Web Application Firewall"
       },
       {
+        "type": "nuclei_scan",
+        "command": "nuclei -u https://{target}:{port} -t /home/kali/nuclei-templates/http,/home/kali/nuclei-templates/ssl -silent -no-color -disable-update-check -timeout 8 -retries 0 -rate-limit 40 -severity info,low,medium,high,critical -exclude-tags dos,fuzz,intrusive 2>&1 || true",
+        "description": "Nuclei HTTP and SSL templates for this web port"
+      },
+      {
         "type": "web_fuzzing",
-        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
+        "command": "ffuf -s -noninteractive -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -fs 0 -timeout 10",
         "description": "Directory and file fuzzing"
       },
       {
@@ -251,22 +261,22 @@
       },
       {
         "type": "param_fuzzing",
-        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -recursion -recursion-depth 2 -timeout 10 2>&1 || true",
+        "command": "ffuf -s -noninteractive -u https://{target}:{port}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,401,403 -t 20 -recursion -recursion-depth 2 -timeout 10 2>&1 || true",
         "description": "Recursive directory fuzzing"
       },
       {
         "type": "param_discovery",
-        "command": "arjun -u https://{target}:{port}/ -oJ /tmp/params_{target}_{port}.json 2>&1 || true",
+        "command": "arjun -q -u https://{target}:{port}/ -oT /tmp/params_{target}_{port}.txt -oJ /tmp/params_{target}_{port}.json >/dev/null 2>&1; if [ -s /tmp/params_{target}_{port}.txt ]; then cat /tmp/params_{target}_{port}.txt; else echo 'No parameters were discovered.'; fi",
         "description": "Discover hidden GET/POST parameters"
       },
       {
         "type": "vhost_fuzzing",
-        "command": "ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u https://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 20 2>&1 || true",
+        "command": "ffuf -s -noninteractive -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u https://{target}:{port}/ -H 'Host: FUZZ.{target}' -mc 200,301,302,401,403 -t 20 2>&1 || true",
         "description": "Virtual host discovery"
       },
       {
         "type": "api_endpoints_enum",
-        "command": "feroxbuster -u https://{target}:{port}/api -w /usr/share/wordlists/dirb/common.txt -x json,xml -t 50 -C 404 --timeout 10 -k 2>&1 || true",
+        "command": "feroxbuster --silent -u https://{target}:{port}/api -w /usr/share/wordlists/dirb/common.txt -x json,xml -t 50 -C 404 --timeout 10 -k 2>&1 || true",
         "description": "Enumerate API endpoints"
       },
       {
@@ -281,12 +291,12 @@
       },
       {
         "type": "api_fuzzing",
-        "command": "wfuzz -z file,/usr/share/seclists/Fuzzing/api-endpoints.txt https://{target}:{port}/api/FUZZ -hc 404 --hh BBB 2>&1 || true",
+        "command": "wfuzz -z file,/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt --hc 404 https://{target}:{port}/api/FUZZ 2>&1 || true",
         "description": "API endpoint fuzzing"
       },
       {
         "type": "backup_files",
-        "command": "ffuf -u https://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-small-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz -t 20 2>&1 || true",
+        "command": "ffuf -s -noninteractive -u https://{target}:{port}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-small-files-lowercase.txt -mc 200,301,302,403 -e .bak,.old,.backup,.zip,.tar.gz -t 20 2>&1 || true",
         "description": "Search for backup files and archives"
       },
       {

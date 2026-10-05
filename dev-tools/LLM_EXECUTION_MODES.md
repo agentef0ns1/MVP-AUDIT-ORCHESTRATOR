@@ -145,7 +145,7 @@ audit_llm_execute_poc(
 
 **Identifier**: `type_3_interactive_llm`
 
-**Description**: LLM has full control over every command executed, making decisions based on previous outputs. Only an initial nmap version scan is performed as bootstrap.
+**Description**: The profile scripts still run in order. After every script for one port (for example all of port 22), the LLM receives the prompt below, reads those outputs, and may record a finding or run extra commands to repeat or deepen that same port. The orchestrator enumerates the next port only when the LLM calls `audit_llm_continue`.
 
 **Use Cases**:
 - Advanced assessments requiring adaptive strategies
@@ -157,13 +157,35 @@ audit_llm_execute_poc(
 ```
 1. Parse nmap input
 2. For each target:
-   3. Execute initial nmap -sV (bootstrap)
-   4. LLM analyzes output
-   5. LLM decides next command
-   6. Execute command
-   7. LLM analyzes output
-   8. REPEAT steps 5-7 until limits reached or LLM decides to stop
+   3. Take the next port (for example 22/ssh)
+   4. Run every profile script for that port and save each output
+   5. Return control to the LLM with the prompt and those outputs
+   6. LLM may record a finding, or repeat and deepen checks on that same port
+   7. LLM calls audit_llm_continue
+   8. REPEAT steps 3-7 for the next port until the profile is finished
 9. Generate report
+```
+
+**Prompt sent when a port finishes** (`prompt` / `next_action`):
+
+```
+Enumeration of one service is finished on {target}.
+Service: {port}/{protocol} {service}.
+The profile scripts for this port already ran. Their outputs are below. Stay on this port.
+
+1. {task} — {description}
+   command: {command}
+   file: {output_path}
+   success: {true|false}
+   excerpt:
+   {output}
+
+Decide from these outputs only:
+- If an output shows a real issue, call audit_record_finding.
+- If a check should be repeated or deepened on this same port (different arguments, or one follow-up tool for this service), call audit_llm_next_command. You may call it more than once. Each call runs on Kali and returns stdout. Read that stdout before the next call.
+- Do not start another port and do not run the next profile service yourself.
+- When this port needs nothing more, call audit_llm_continue(project_id="{project_id}", target_id="{target_id}"). That runs the full enumeration of the next port and stops again.
+No DoS, no brute-force, no exploitation.
 ```
 
 **Limits** (per target):
@@ -181,27 +203,16 @@ audit_start(
     execution_mode="type_3_interactive_llm"  # Full LLM control
 )
 
-# Run audit (will execute bootstrap nmap)
-audit_run(project_id="abc-123")
+# Run audit. It stops after the first port and returns prompt.
+audit_start_and_run(..., execution_mode="type_3_interactive_llm")
 
-# LLM takes control and uses these tools in a loop:
+# LLM reads prompt (that port's commands and excerpts), then optionally:
+audit_record_finding(...)
+audit_llm_next_command(project_id, target_id, command, reason)
 
-# 1. Get current context
-context = audit_llm_get_context(
-    project_id="abc-123",
-    target_id="target-456"
-)
-
-# 2. Decide and execute next command
-result = audit_llm_next_command(
-    project_id="abc-123",
-    target_id="target-456",
-    command="whatweb http://10.19.220.25:8088",
-    reason="Previous nmap -sV showed HTTP on 8088, checking web technologies"
-)
-
-# 3. Analyze result, decide next command
-# ... repeat until limits reached or objective completed
+# Hand control back so the MCP enumerates the next port.
+audit_llm_continue(project_id, target_id)
+# Repeat until that call returns done=true.
 ```
 
 **LLM Tools for Type 3**:
@@ -234,7 +245,7 @@ result = audit_llm_next_command(
 | Feature | Type 1 | Type 2 | Type 3 |
 |---------|--------|--------|--------|
 | LLM Required | ❌ No | ✅ Yes | ✅ Yes |
-| Decision Making | JSON profile | LLM (post-enum) | LLM (every step) |
+| Decision Making | JSON profile | LLM (post-enum) | LLM (every port) |
 | Speed | ⚡ Fast | 🐢 Moderate | 🐌 Slow |
 | Thoroughness | ⭐⭐⭐ Good | ⭐⭐⭐⭐ Very Good | ⭐⭐⭐⭐⭐ Excellent |
 | Resource Usage | Low | Medium | High |

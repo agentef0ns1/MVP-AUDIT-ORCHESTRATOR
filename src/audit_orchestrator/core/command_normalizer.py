@@ -14,6 +14,7 @@ TOOL_ABSOLUTE_PATHS = {
     "gobuster": "/usr/bin/gobuster",
     "dirb": "/usr/bin/dirb",
     "feroxbuster": "/usr/bin/feroxbuster",
+    "nuclei": "/usr/bin/nuclei",
     "arjun": "/usr/bin/arjun",
     
     # Web scanners

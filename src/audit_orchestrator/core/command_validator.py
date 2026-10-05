@@ -12,7 +12,7 @@ ALLOWED_TOOLS = [
     # Web scanning
     "whatweb", "wafw00f", "nikto", "wpscan", "droopescan", "joomscan", "cmseek",
     # Fuzzing and enumeration
-    "ffuf", "gobuster", "dirb", "dirbuster", "feroxbuster", "wfuzz", "arjun",
+    "ffuf", "gobuster", "dirb", "dirbuster", "feroxbuster", "wfuzz", "arjun", "nuclei",
     # SSL/TLS
     "sslscan", "testssl", "testssl.sh",
     # SSH

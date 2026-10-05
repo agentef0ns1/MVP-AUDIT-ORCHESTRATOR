@@ -29,6 +29,7 @@ from audit_orchestrator.core.tool_installer import (
     get_install_command,
 )
 from audit_orchestrator.core.command_normalizer import normalize_command
+from audit_orchestrator.core.output_filter import prepare_enumeration_output
 
 
 class AuditProfile:
@@ -144,6 +145,18 @@ class AuditOrchestrator:
         if awaiting_llm:
             status = "pending_llm_analysis"
             last = f"{awaiting_llm} targets awaiting LLM analysis"
+            self._live(
+                force=True,
+                phase="LLM",
+                status="waiting",
+                llm="pending analysis",
+                last=last,
+                progress=(
+                    f"hosts {targets_completed}   pending {pending}   "
+                    f"fail {targets_failed}   findings {findings_created}"
+                ),
+            )
+            return status, stats
         elif pending == 0 and targets_failed == 0 and targets_processed > 0:
             self.store.update_project_status(project_id, "completed")
             status = "completed"
@@ -398,6 +411,7 @@ class AuditOrchestrator:
                             "target_id": target_id,
                             "target_name": target_name,
                             "host_context": result.get("host_context"),
+                            "step": result.get("step"),
                         })
                         self._live(
                             phase="LLM",
@@ -682,6 +696,7 @@ class AuditOrchestrator:
                         "target": target_name,
                         "target_id": target_id,
                         "host_context": result.get("host_context"),
+                        "step": result.get("step"),
                         "services_audited": result.get("services_audited", 0),
                         "findings_created": result.get("findings_created", 0),
                     }
@@ -758,6 +773,7 @@ class AuditOrchestrator:
                     "target_id": result.get("target_id"),
                     "target_name": result.get("target"),
                     "host_context": result.get("host_context"),
+                    "step": result.get("step"),
                 })
             elif result.get("success"):
                 targets_completed += 1
@@ -980,6 +996,64 @@ class AuditOrchestrator:
             "host_context": host_context
         }
     
+    def _type3_state_path(self, workspace: WorkspaceManager, target_name: str) -> Path:
+        safe = workspace._sanitize_filename(target_name)
+        return workspace.base_path / safe / "type3_state.json"
+
+    def _load_type3_state(self, workspace: WorkspaceManager, target_name: str) -> dict[str, Any] | None:
+        path = self._type3_state_path(workspace, target_name)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _save_type3_state(
+        self,
+        workspace: WorkspaceManager,
+        target_name: str,
+        state: dict[str, Any],
+    ) -> None:
+        path = self._type3_state_path(workspace, target_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    async def _build_type3_queue(
+        self,
+        project_id: str,
+        target_id: str,
+        target_name: str,
+        profile: AuditProfile,
+        workspace: WorkspaceManager,
+        kali_client: KaliMCPClient,
+    ) -> list[dict[str, Any]]:
+        """Profile tasks in order. HTTP vs HTTPS is decided once, before the tasks run."""
+        queue: list[dict[str, Any]] = []
+        for service in self.store.get_services_by_target(target_id):
+            service_name = service.get("service_name") or "unknown"
+            effective = service_name
+            lowered = service_name.lower()
+            is_http = "http" in lowered or lowered in ("www", "web", "radan-http")
+            has_ssl_name = "ssl" in lowered or "tls" in lowered or lowered == "https"
+            if is_http and not has_ssl_name:
+                has_ssl = await self._detect_ssl_on_port(
+                    target_name, service["port"], service_name, kali_client, workspace
+                )
+                if has_ssl:
+                    effective = "https"
+            for task in profile.get_tasks_for_service(effective):
+                queue.append({
+                    "service_id": service["service_id"],
+                    "port": service["port"],
+                    "protocol": service.get("protocol") or "tcp",
+                    "service_name": service_name,
+                    "effective_service": effective,
+                    "task": task,
+                })
+        return queue
+
     async def _audit_target_type3(
         self,
         project_id: str,
@@ -988,92 +1062,327 @@ class AuditOrchestrator:
         workspace: WorkspaceManager,
         kali_client: KaliMCPClient
     ) -> dict[str, Any]:
-        """Type 3: LLM has full control, with limits (50 commands, 30 minutes)"""
+        """Run every profile task for one port, then hand those outputs to the LLM.
+
+        The LLM may record a finding or run extra commands on that same port.
+        The next port starts only after audit_llm_continue.
+        """
         target_id = target["target_id"]
         target_name = target["ip_or_hostname"]
-        
-        # Create execution state tracker
-        state_id = self.store.create_llm_execution_state(project_id, target_id)
-        
-        # Limits
-        MAX_COMMANDS = 50
-        MAX_TIME_SECONDS = 1800  # 30 minutes
-        
-        # Bootstrap: Execute initial nmap version scan
-        services = self.store.get_services_by_target(target_id)
-        bootstrap_output = ""
-        
-        if services:
-            # Build port list for nmap
-            ports = ",".join(str(s["port"]) for s in services)
-            bootstrap_cmd = f"nmap -sV -p {ports} {target_name}"
-            
-            self._live(
-                phase="LLM",
-                asset=target_name,
-                llm="bootstrap",
-                mcp="kali POST /api/command",
-                command=bootstrap_cmd,
-                status="running",
+        try:
+            state_id = self.store.get_llm_execution_state(project_id, target_id)["state_id"]
+        except ValueError:
+            state_id = self.store.create_llm_execution_state(project_id, target_id)
+
+        state = self._load_type3_state(workspace, target_name)
+        if state is None:
+            queue = await self._build_type3_queue(
+                project_id, target_id, target_name, profile, workspace, kali_client
             )
-            try:
-                result = await kali_client.execute(bootstrap_cmd, timeout=300)
-                bootstrap_output = result.get("stdout", "")
-                self._live(
-                    phase="LLM",
-                    asset=target_name,
-                    status="done",
-                    last="bootstrap nmap finished",
-                    llm="control",
-                )
-                
-                # Update execution state
-                self.store.update_llm_execution_state(
-                    state_id,
-                    commands_executed=1,
-                    execution_time_seconds=result.get("execution_time", 0),
-                    last_command=bootstrap_cmd,
-                    last_output=bootstrap_output
-                )
-                
-                # Log to bitacora
-                self.store.log_bitacora(
-                    project_id=project_id,
-                    target_id=target_id,
-                    operation=f"Type 3 Bootstrap: {bootstrap_cmd}",
-                    result="completed",
-                    notes=f"Initial enumeration. LLM will take full control. Limits: {MAX_COMMANDS} commands, {MAX_TIME_SECONDS}s"
-                )
-                
-                workspace.append_bitacora(
-                    target_name,
-                    "TYPE 3 BOOTSTRAP",
-                    f"Initial scan completed. LLM now has full control (limits: {MAX_COMMANDS} cmds, 30 min)",
-                    result="llm_control"
-                )
-                
-            except Exception as e:
-                self.store.log_bitacora(
-                    project_id=project_id,
-                    target_id=target_id,
-                    operation=f"Type 3 Bootstrap failed: {bootstrap_cmd}",
-                    result="error",
-                    notes=str(e)
-                )
-        
-        return {
-            "services_audited": 1,
-            "findings_created": 0,
-            "requires_llm_control": True,
-            "state_id": state_id,
-            "limits": {
-                "max_commands": MAX_COMMANDS,
-                "max_time_seconds": MAX_TIME_SECONDS,
-                "commands_used": 1,
-                "time_used": result.get("execution_time", 0) if services else 0
-            },
-            "bootstrap_output": bootstrap_output
+            state = {
+                "queue": queue,
+                "index": 0,
+                "awaiting_llm": False,
+                "last_step": None,
+                "pause_unit": "service",
+            }
+            self._save_type3_state(workspace, target_name, state)
+
+        if state.get("awaiting_llm") and state.get("last_step"):
+            return {
+                "services_audited": 0,
+                "findings_created": 0,
+                "requires_llm_analysis": True,
+                "state_id": state_id,
+                "step": state["last_step"],
+                "prompt": self._type3_prompt(project_id, target_id, target_name, state["last_step"]),
+            }
+
+        queue = state.get("queue") or []
+        index = int(state.get("index") or 0)
+        if index >= len(queue):
+            for service in self.store.get_services_by_target(target_id):
+                if service.get("status") != "completed":
+                    self.store.update_service_status(service["service_id"], "completed")
+            return {
+                "services_audited": len(self.store.get_services_by_target(target_id)),
+                "findings_created": 0,
+                "requires_llm_analysis": False,
+                "done": True,
+                "state_id": state_id,
+            }
+
+        service_id = queue[index]["service_id"]
+        previous = state.get("active_service_id")
+        if previous and previous != service_id:
+            self.store.update_service_status(previous, "completed")
+        self.store.update_service_status(service_id, "running")
+
+        carried = [
+            step for step in (state.get("resume_steps") or [])
+            if isinstance(step, dict) and step.get("port") == queue[index]["port"]
+        ]
+        steps: list[dict[str, Any]] = list(carried)
+        findings_created = 0
+        last_output = ""
+        while index < len(queue) and queue[index]["service_id"] == service_id:
+            item = queue[index]
+            task_config = item["task"]
+            task_result = await self._execute_task(
+                project_id=project_id,
+                target_id=target_id,
+                target_name=target_name,
+                service_id=item["service_id"],
+                port=item["port"],
+                protocol=item["protocol"],
+                service_name=item["effective_service"],
+                task_config=task_config,
+                workspace=workspace,
+                kali_client=kali_client,
+                timeout=600,
+            )
+            output = task_result.get("output") or task_result.get("error") or ""
+            last_output = output
+            if task_result.get("success") and task_result.get("output"):
+                for finding in self._analyze_for_findings(
+                    task_result["output"], target_name, item["port"], item["service_name"]
+                ):
+                    created = await self._create_finding(
+                        project_id=project_id,
+                        target_id=target_id,
+                        target_name=target_name,
+                        service_id=item["service_id"],
+                        port=item["port"],
+                        service_name=item["service_name"],
+                        finding_data=finding,
+                        workspace=workspace,
+                    )
+                    if created:
+                        findings_created += 1
+            steps.append({
+                "task": task_config.get("type"),
+                "description": task_config.get("description"),
+                "command": task_result.get("command") or task_config.get("command"),
+                "success": bool(task_result.get("success")),
+                "output_path": task_result.get("output_path"),
+                "output_excerpt": output[:2000],
+            })
+            index += 1
+
+        item = queue[index - 1]
+        step = {
+            "index": index,
+            "total": len(queue),
+            "port": item["port"],
+            "protocol": item["protocol"],
+            "service_name": item["effective_service"],
+            "service_id": service_id,
+            "task": item["effective_service"],
+            "tasks": [entry.get("task") for entry in steps],
+            "steps": steps,
+            "command": steps[-1].get("command") if steps else None,
+            "success": all(entry.get("success") for entry in steps) if steps else False,
+            "output_excerpt": "\n\n".join(
+                f"[{entry.get('task')}]\n{entry.get('output_excerpt') or ''}" for entry in steps
+            )[:8000],
         }
+        state["pause_unit"] = "service"
+        state["index"] = index
+        state["awaiting_llm"] = True
+        state["active_service_id"] = service_id
+        state["resume_steps"] = []
+        state["last_step"] = step
+        self._save_type3_state(workspace, target_name, state)
+        task_names = ", ".join(str(name) for name in step["tasks"])
+        self.store.log_bitacora(
+            project_id=project_id,
+            target_id=target_id,
+            service_id=service_id,
+            operation=f"Type 3 service {item['port']}/{item['protocol']} finished",
+            result="pending_llm",
+            notes=f"Enumeration of this port finished ({task_names}). Waiting for the LLM.",
+        )
+        workspace.append_bitacora(
+            target_name,
+            f"TYPE 3 SERVICE {item['port']}/{item['protocol']}",
+            f"{item['effective_service']} enumeration finished. Waiting for LLM. Tasks: {task_names}",
+            result="pending_llm",
+        )
+        prompt = self._type3_prompt(project_id, target_id, target_name, step)
+        self.publish_llm_prompt(
+            workspace,
+            target_name,
+            prompt,
+            service=f"{item['port']}/{item['protocol']} {item['effective_service']}",
+            mcp="audit_llm_get_context",
+            command=step["command"] or "-",
+            output="-",
+            last=f"{item['port']}/{item['protocol']} awaiting LLM",
+        )
+        return {
+            "services_audited": 0,
+            "findings_created": findings_created,
+            "requires_llm_analysis": True,
+            "state_id": state_id,
+            "step": step,
+            "prompt": self._type3_prompt(project_id, target_id, target_name, step),
+        }
+
+    def publish_llm_prompt(
+        self,
+        workspace: WorkspaceManager,
+        target_name: str,
+        prompt: str,
+        **live: Any,
+    ) -> None:
+        """Show the exact text handed to the model, and append it to audit.log."""
+        self._live(
+            phase="LLM",
+            asset=target_name,
+            llm="prompt",
+            status="waiting",
+            ask=prompt,
+            answer="-",
+            **live,
+        )
+        try:
+            workspace.append_bitacora(target_name, "LLM PROMPT", prompt, result="pending_llm")
+        except Exception:
+            return
+
+    def _type3_prompt(
+        self,
+        project_id: str,
+        target_id: str,
+        target_name: str,
+        step: dict[str, Any],
+    ) -> str:
+        """Prompt sent to the LLM after one port's profile enumeration."""
+        port = step.get("port")
+        protocol = step.get("protocol") or "tcp"
+        service = step.get("service_name") or "unknown"
+        blocks: list[str] = []
+        for number, entry in enumerate(step.get("steps") or [], start=1):
+            excerpt = (entry.get("output_excerpt") or "").strip() or "(empty)"
+            blocks.append(
+                f"{number}. {entry.get('task') or 'task'}"
+                f" — {entry.get('description') or ''}\n"
+                f"   command: {entry.get('command') or '-'}\n"
+                f"   file: {entry.get('output_path') or '-'}\n"
+                f"   success: {entry.get('success')}\n"
+                f"   excerpt:\n{excerpt}"
+            )
+        if not blocks and step.get("output_excerpt"):
+            blocks.append(str(step.get("output_excerpt")))
+        outputs = "\n\n".join(blocks) if blocks else "(no output)"
+        return (
+            f"Enumeration of one service is finished on {target_name}.\n"
+            f"Service: {port}/{protocol} {service}.\n"
+            "The profile scripts for this port already ran. Their outputs are below. "
+            "Stay on this port.\n\n"
+            f"{outputs}\n\n"
+            "Decide from these outputs only:\n"
+            "- If an output shows a real issue, call audit_record_finding.\n"
+            "- If a check should be repeated or deepened on this same port "
+            "(different arguments, or one follow-up tool for this service), "
+            "call audit_llm_next_command with a different command. "
+            "Each call runs on Kali and returns stdout. Read that stdout before the next call. "
+            "Never send the same command twice.\n"
+            "- Do not start another port and do not run the next profile service yourself.\n"
+            "- When this port needs nothing more, call "
+            f'audit_llm_continue(project_id="{project_id}", target_id="{target_id}"). '
+            "That runs the full enumeration of the next port and stops again.\n"
+            "No DoS, no brute-force, no exploitation."
+        )
+
+    def type3_handoff(self, project_id: str, target_id: str) -> dict[str, Any]:
+        """Prompt for the LLM paused after one port's enumeration."""
+        project = self.store.get_project(project_id)
+        target = self.store.get_target(target_id)
+        target_name = target["ip_or_hostname"]
+        workspace = WorkspaceManager(project["base_path"])
+        state = self._load_type3_state(workspace, target_name) or {}
+        step = state.get("last_step") or {}
+        continue_with = {
+            "tool": "audit_llm_continue",
+            "project_id": project_id,
+            "target_id": target_id,
+        }
+        if state.get("awaiting_llm") and state.get("pause_unit") != "service":
+            prompt = (
+                f"Port enumeration on {target_name} is not finished yet. "
+                "The previous pause happened after a single script. "
+                "Call "
+                f'audit_llm_continue(project_id="{project_id}", target_id="{target_id}") '
+                "once and do not run other commands before it. "
+                "That call finishes the remaining profile scripts of this same port "
+                "and then returns the analysis prompt with every output."
+            )
+        else:
+            prompt = self._type3_prompt(project_id, target_id, target_name, step)
+        return {
+            "step": step or None,
+            "continue_with": continue_with,
+            "prompt": prompt,
+            "instructions": prompt,
+        }
+
+    async def continue_type3(self, project_id: str, target_id: str) -> dict[str, Any]:
+        """LLM finished this step. Run the next profile task, or close the target."""
+        project = self.store.get_project(project_id)
+        if project.get("execution_mode") != "type_3_interactive_llm":
+            raise AuditOrchestratorError(
+                "invalid_mode",
+                f"audit_llm_continue is only for type_3_interactive_llm, got {project.get('execution_mode')}",
+            )
+        target = self.store.get_target(target_id)
+        target_name = target["ip_or_hostname"]
+        workspace = WorkspaceManager(project["base_path"])
+        state = self._load_type3_state(workspace, target_name)
+        if not state or not state.get("awaiting_llm"):
+            raise AuditOrchestratorError(
+                "type3_not_waiting",
+                "No profile step is waiting for the LLM on this target.",
+            )
+        if state.get("pause_unit") != "service":
+            finished = int((state.get("last_step") or {}).get("index") or 0)
+            state["index"] = finished
+            previous = state.get("last_step")
+            if isinstance(previous, dict) and previous.get("steps"):
+                state["resume_steps"] = list(previous["steps"])
+            elif isinstance(previous, dict) and previous.get("task"):
+                state["resume_steps"] = [previous]
+        state["awaiting_llm"] = False
+        state["pause_unit"] = "service"
+        self._save_type3_state(workspace, target_name, state)
+        profile = self._load_profile(project.get("profile") or "default_blackbox")
+        async with KaliClientFactory.create() as kali_client:
+            result = await self._audit_target_type3(
+                project_id, target, profile, workspace, kali_client
+            )
+        if result.get("requires_llm_analysis"):
+            self.store.update_target_status(target_id, "pending_llm_analysis")
+            result["done"] = False
+            result["target_id"] = target_id
+            result["target_name"] = target_name
+            return result
+        self.store.update_target_status(target_id, "completed")
+        self.store.log_bitacora(
+            project_id=project_id,
+            target_id=target_id,
+            operation=f"Target audit completed: {target_name}",
+            result="success",
+            notes="Type 3 profile finished after the LLM steps.",
+        )
+        stats = self.store.get_project_statistics(project_id)
+        waiting = stats["targets_by_status"].get("pending_llm_analysis", 0)
+        pending = stats["targets_by_status"].get("pending", 0)
+        if waiting == 0 and pending == 0:
+            self.store.update_project_status(project_id, "completed")
+        result["done"] = True
+        result["target_id"] = target_id
+        result["target_name"] = target_name
+        return result
     
     def _build_host_context(self, project_id: str, target_id: str) -> dict[str, Any]:
         """Build complete host context for LLM analysis"""
@@ -1549,6 +1858,9 @@ class AuditOrchestrator:
             status="running",
             llm="idle",
             last=task_type,
+            output="-",
+            ask="-",
+            answer="-",
         )
         
         # Ensure tool is installed before execution
@@ -1598,10 +1910,11 @@ class AuditOrchestrator:
             output_path = None
             if result.get("output"):
                 try:
+                    saved_output = prepare_enumeration_output(task_type, result["output"])
                     output_path = workspace.write_enumeration_output(
                         target=target_name,
                         task_type=task_type,
-                        output=result["output"]
+                        output=saved_output
                     )
                 except Exception as e:
                     # If file write fails, log but continue
@@ -1654,6 +1967,8 @@ class AuditOrchestrator:
                 output=result.get("output") or result.get("error") or "",
                 last=f"{task_type} {outcome}",
             )
+            result["output_path"] = output_path
+            result["command"] = command
             return result
         
         except Exception as e:

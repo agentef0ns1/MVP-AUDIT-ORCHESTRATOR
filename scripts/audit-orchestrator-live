@@ -1,0 +1,5 @@
+#!/bin/sh
+# Live audit screen. Not on PATH; run it by path:
+#   /opt/cline-mcps/MVP-audit-orchestrator/scripts/audit-orchestrator-live BASE_PATH
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+exec "$ROOT/.venv/bin/python" -m audit_orchestrator.live_console "$@"

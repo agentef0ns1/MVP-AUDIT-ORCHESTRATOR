@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 from audit_orchestrator.mcp_compat import FastMCP
@@ -50,6 +51,74 @@ def get_orchestrator() -> AuditOrchestrator:
 def _ok(data: dict[str, Any]) -> str:
     """Format success response"""
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _normalize_command(command: str) -> str:
+    return " ".join((command or "").split())
+
+
+def _duplicate_command_message(project_id: str, target_id: str, command: str) -> str:
+    return (
+        f"Command already ran and was not executed again: {command}. "
+        "The MCP kept control and continued the profile. "
+        f'When the next port is ready, call audit_llm_continue(project_id="{project_id}", target_id="{target_id}") '
+        "only after analyzing that port."
+    )
+
+
+def _continue_after_repeat(orch, project, project_id: str, target_id: str, target_name: str, command: str) -> dict:
+    """A repeated LLM command does not stop the audit. The MCP enumerates the next port."""
+    _show_llm(
+        project["base_path"],
+        asset=target_name,
+        phase="LLM",
+        llm="continue profile",
+        mcp="audit_llm_continue",
+        command=command,
+        ask="repeated command ignored",
+        answer="MCP continues with the next port",
+        status="running",
+        output="-",
+    )
+    try:
+        from audit_orchestrator.core.filesystem import WorkspaceManager
+        WorkspaceManager(project["base_path"]).append_bitacora(
+            target_name,
+            "LLM REPEAT",
+            f"Ignored repeated command and continued the profile: {command}",
+            result="pending_llm",
+        )
+    except Exception:
+        pass
+    result = asyncio.run(orch.continue_type3(project_id, target_id))
+    note = _duplicate_command_message(project_id, target_id, command)
+    if result.get("done"):
+        return {
+            "success": True,
+            "done": True,
+            "skipped_duplicate": True,
+            "project_id": project_id,
+            "target_id": target_id,
+            "target_name": result.get("target_name") or target_name,
+            "command": command,
+            "note": note + " Profile finished for this target.",
+            "next_action": None,
+        }
+    handoff = orch.type3_handoff(project_id, target_id)
+    return {
+        "success": True,
+        "done": False,
+        "skipped_duplicate": True,
+        "project_id": project_id,
+        "target_id": target_id,
+        "target_name": result.get("target_name") or target_name,
+        "command": command,
+        "step": handoff["step"],
+        "prompt": handoff["prompt"],
+        "continue_with": handoff["continue_with"],
+        "next_action": handoff["prompt"],
+        "note": note,
+    }
 
 
 def _err(code: str, message: str) -> str:
@@ -107,6 +176,25 @@ def _make_live_sink(ctx: Context, pending: list[asyncio.Task]):
     return sink
 
 
+def _show_llm(base_path: str, **fields: Any) -> None:
+    """Paint one asset box, including the LLM question and answer."""
+    from pathlib import Path
+
+    orch = get_orchestrator()
+    if orch.live is None:
+        orch.live = LiveScreen()
+    orch.live.frame_path = Path(base_path) / "audit-live.txt"
+    _arm_live_console(base_path)
+    orch._live(force=True, **fields)
+
+
+def _arm_live_console(base_path: str) -> None:
+    """Open the redraw terminal. The audit continues if the window cannot open."""
+    from audit_orchestrator.core.live_terminal import open_live_terminal
+
+    open_live_terminal(base_path)
+
+
 def _bind_live(ctx: Context) -> LiveScreen:
     pending: list[asyncio.Task] = []
     screen = LiveScreen(sink=_make_live_sink(ctx, pending))
@@ -122,6 +210,74 @@ async def _ok_live(data: dict[str, Any], screen: LiveScreen) -> str:
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     return screen.message() + "\n\n" + _ok(data)
+
+
+def _record_llm_prompt(
+    base_path: str,
+    target_name: str,
+    prompt: str,
+    answer: str = "-",
+    **live: Any,
+) -> None:
+    """Paint the prompt the model receives and append that same text to audit.log."""
+    _show_llm(
+        base_path,
+        asset=target_name,
+        phase="LLM",
+        llm="prompt",
+        status="waiting",
+        ask=prompt,
+        answer=answer,
+        **live,
+    )
+    logged = prompt if not answer or answer == "-" else f"{prompt}\n\nstdout:\n{answer}"
+    try:
+        from audit_orchestrator.core.filesystem import WorkspaceManager
+        WorkspaceManager(base_path).append_bitacora(
+            target_name, "LLM PROMPT", logged, result="pending_llm"
+        )
+    except Exception:
+        return
+
+
+def _type2_prompt(pending_llm: list[dict[str, Any]]) -> str:
+    """Type 2 handoff: the instruction plus the service index sent with it."""
+    lines = [_next_action_for("type_2_post_host_llm"), ""]
+    for item in pending_llm:
+        lines.append(f"Target: {item.get('target_name') or item.get('target_id')}")
+        for service in item.get("services") or []:
+            version = service.get("version") or ""
+            lines.append(
+                " ".join(
+                    part for part in (
+                        f"{service.get('port')}/{service.get('protocol')} {service.get('service_name') or ''}".strip(),
+                        version,
+                    ) if part
+                )
+            )
+    return "\n".join(lines).strip()
+
+
+def _next_action_for(execution_mode: str) -> str:
+    if execution_mode == "type_3_interactive_llm":
+        return (
+            "Enumeration of one port just finished. Read the prompt. "
+            "It lists that port's commands and output excerpts. "
+            "Record a real issue with audit_record_finding, or repeat and deepen "
+            "checks on that same port with audit_llm_next_command. "
+            "When that port needs nothing more, call audit_llm_continue(project_id, target_id). "
+            "That runs the next port and stops again. "
+            "Keep going until audit_llm_continue returns done=true. "
+            "No DoS, no brute-force, no exploitation."
+        )
+    return (
+        "Call audit_llm_analyze_host(project_id, target_id) once to get the service index. "
+        "Then call it again with port= for one service at a time and read only those files. "
+        "Do not write an analysis, do not list negative results, and do not invent CVE identifiers. "
+        "After each service, run at most one safe command with "
+        "audit_llm_execute_poc(project_id, target_id, command, reason), or skip it. "
+        "No DoS, no brute-force, no exploitation."
+    )
 
 
 def _compact_pending_llm(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -145,6 +301,7 @@ def _compact_pending_llm(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "target_name": item.get("target_name"),
             "summary": context.get("summary") or {},
             "services": services,
+            "step": item.get("step"),
         })
     return compact
 
@@ -186,7 +343,7 @@ def audit_start(
         execution_mode: Execution mode:
             - "type_1_no_llm": Fixed sequence from JSON (no LLM)
             - "type_2_post_host_llm": LLM analyzes after host enumeration, executes PoCs
-            - "type_3_interactive_llm": LLM has full control (limits: 50 commands, 30 min)
+            - "type_3_interactive_llm": LLM reviews each finished port (limits: 50 commands, 30 min)
         reset: Reset existing workspace if True
     
     Returns:
@@ -249,6 +406,8 @@ async def audit_run(
     orchestrator = get_orchestrator()
     screen = _bind_live(ctx) if ctx is not None else LiveScreen()
     try:
+        project = orchestrator.store.get_project(project_id)
+        _arm_live_console(project["base_path"])
         if parallel:
             result = await orchestrator.run_audit_parallel(
                 project_id=project_id,
@@ -393,6 +552,7 @@ async def audit_start_and_run(
             base_path, input_file, profile, execution_mode, reset
         )
         project_id = start_result["project_id"]
+        _arm_live_console(base_path)
         if parallel:
             run_result = await orch.run_audit_parallel(
                 project_id, max_targets, max_concurrent
@@ -403,8 +563,13 @@ async def audit_start_and_run(
         status = run_result.get("status", "completed")
         if pending_llm:
             status = "pending_llm_analysis"
+        handoff = None
+        if execution_mode == "type_3_interactive_llm" and pending_llm:
+            handoff = orch.type3_handoff(project_id, pending_llm[0]["target_id"])
         note = "Audit started and executed successfully. Results in: " + base_path
-        if pending_llm:
+        if handoff:
+            note = "One port finished. The prompt is in next_action. Follow it, then call continue_with."
+        elif pending_llm:
             note = (
                 "Enumeration finished. Do not analyze this response in prose. "
                 "Follow next_action and stop after the tool calls."
@@ -426,16 +591,22 @@ async def audit_start_and_run(
             },
             "status": status,
             "pending_llm": pending_llm,
-            "next_action": (
-                "Call audit_llm_analyze_host(project_id, target_id) once to get the service index. "
-                "Then call it again with port= for one service at a time and read only those files. "
-                "Do not write an analysis, do not list negative results, and do not invent CVE identifiers. "
-                "After each service, run at most one safe command with "
-                "audit_llm_execute_poc(project_id, target_id, command, reason), or skip it. "
-                "No DoS, no brute-force, no exploitation."
-            ) if pending_llm else None,
+            "step": (handoff or {}).get("step"),
+            "prompt": (handoff or {}).get("prompt"),
+            "continue_with": (handoff or {}).get("continue_with"),
+            "next_action": (handoff or {}).get("prompt") if handoff else (
+                _type2_prompt(pending_llm) if pending_llm else None
+            ),
             "note": note
         }
+        if pending_llm and not handoff:
+            payload["prompt"] = payload["next_action"]
+            _record_llm_prompt(
+                base_path,
+                pending_llm[0].get("target_name") or "target",
+                payload["prompt"],
+                mcp="audit_llm_analyze_host",
+            )
         return await _ok_live(payload, screen)
     except AuditOrchestratorError as e:
         return _err(e.code, e.message)
@@ -477,6 +648,7 @@ async def audit_resume(
                 "project_not_found",
                 f"No audit project found at {base_path}. Use audit_start_and_run() to create one."
             )
+        _arm_live_console(base_path)
         run_result = await orch.run_audit(project_id, max_targets)
         payload = {
             "success": True,
@@ -873,6 +1045,7 @@ def audit_llm_analyze_host(
             }
 
         services = orch.store.get_services_by_target(target_id)
+        target_name = target.get("ip_or_hostname") or target_id
         if port is None:
             index = []
             for service in services:
@@ -891,19 +1064,31 @@ def audit_llm_analyze_host(
                         for task in tasks
                     ],
                 })
+            lines = [
+                f"{item.get('port')}/{item.get('protocol')} {item.get('service_name') or ''}".strip()
+                for item in index
+            ]
+            instructions = (
+                "This is only the index. Do not analyze it and do not list CVEs. "
+                "Call audit_llm_analyze_host again with port= for one service. "
+                "Read those files, run at most one safe PoC with audit_llm_execute_poc "
+                "or skip the service, then request the next port."
+            )
+            _record_llm_prompt(
+                project["base_path"],
+                target_name,
+                instructions + "\n\n" + ("\n".join(lines) or "no services"),
+                mcp="audit_llm_analyze_host",
+                status="index",
+            )
             return {
                 "success": True,
                 "mode": "service_index",
                 "project_id": project_id,
                 "target_id": target_id,
-                "target_name": target.get("ip_or_hostname"),
+                "target_name": target_name,
                 "services": index,
-                "instructions": (
-                    "This is only the index. Do not analyze it and do not list CVEs. "
-                    "Call audit_llm_analyze_host again with port= for one service. "
-                    "Read those files, run at most one safe PoC with audit_llm_execute_poc "
-                    "or skip the service, then request the next port."
-                ),
+                "instructions": instructions,
             }
 
         selected = [service for service in services if service.get("port") == port]
@@ -915,6 +1100,31 @@ def audit_llm_analyze_host(
         service = selected[0]
         tasks = orch._attach_output_excerpts(
             orch.store.get_tasks_by_service(service["service_id"])
+        )
+        bits = []
+        for task in tasks:
+            path = task.get("output_path")
+            full = ""
+            if path:
+                try:
+                    full = Path(path).read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    full = ""
+            excerpt_text = full or task.get("output_excerpt") or task.get("output") or ""
+            bits.append(f"{task.get('task_type')}: {excerpt_text}".strip())
+        instructions = (
+            "These files belong only to this port. "
+            "Do not invent CVE identifiers and do not list checks that found nothing. "
+            "If a safe check is useful, call audit_llm_execute_poc once for this port. "
+            "Then call audit_llm_analyze_host with the next port."
+        )
+        _record_llm_prompt(
+            project["base_path"],
+            target_name,
+            instructions + "\n\n" + ("\n\n".join(bits) or "no output"),
+            service=f"{port}/{service.get('protocol')} {service.get('service_name') or ''}".strip(),
+            mcp="audit_llm_analyze_host",
+            status="files",
         )
         return {
             "success": True,
@@ -929,12 +1139,7 @@ def audit_llm_analyze_host(
                 "version": service.get("version"),
             },
             "tasks": tasks,
-            "instructions": (
-                "These files belong only to this port. "
-                "Do not invent CVE identifiers and do not list checks that found nothing. "
-                "If a safe check is useful, call audit_llm_execute_poc once for this port. "
-                "Then call audit_llm_analyze_host with the next port."
-            ),
+            "instructions": instructions,
         }
 
     return _handle(_impl)
@@ -996,11 +1201,30 @@ def audit_llm_execute_poc(
                 f"Command blocked: {reason_blocked}"
             )
         
-        # Execute command
+        _show_llm(
+            project["base_path"],
+            asset=target_name,
+            phase="LLM",
+            llm="asking",
+            mcp="audit_llm_execute_poc",
+            command=command,
+            ask=reason,
+            status="running",
+        )
         kali_client = KaliMCPClient(orch.settings.kali_server_url)
         result = asyncio.run(kali_client.execute(command, timeout))
-        
-        # Log to bitacora
+        reply = result.get("stdout") or result.get("stderr") or ""
+        _record_llm_prompt(
+            project["base_path"],
+            target_name,
+            f"Command finished: {command}\nReason: {reason}",
+            answer=reply,
+            mcp="audit_llm_execute_poc",
+            command=command,
+            output=reply,
+            status=f"exit {result.get('exit_code')}",
+        )
+
         orch.store.log_bitacora(
             project_id=project_id,
             target_id=target_id,
@@ -1029,17 +1253,11 @@ def audit_llm_get_context(
     target_id: str
 ) -> str:
     """
-    [Type 3 Mode] Get current context for LLM-driven audit.
-    
-    Returns current state including previous command outputs and execution limits.
-    Use this to decide what command to run next.
-    
-    Args:
-        project_id: Project ID
-        target_id: Target ID
-    
-    Returns:
-        JSON with host_context, execution_state, and limits
+    [Type 3] Show the prompt for the port whose enumeration just finished.
+
+    Read prompt. It contains that port's commands and excerpts.
+    Optional: audit_record_finding, or audit_llm_next_command to repeat or deepen that port.
+    The next port runs only when you call continue_with, which is audit_llm_continue.
     """
     def _impl():
         orch = get_orchestrator()
@@ -1055,45 +1273,107 @@ def audit_llm_get_context(
                 "message": f"This tool is only for Type 3 mode. Project is in {project.get('execution_mode')} mode."
             }
         
-        # Get context and execution state
-        context = orch._build_host_context(project_id, target_id)
-        
+        handoff = orch.type3_handoff(project_id, target_id)
+        step = handoff.get("step") or {}
+        target_name = target.get("ip_or_hostname") or target_id
+        prompt = handoff.get("prompt") or ""
+        _record_llm_prompt(
+            project["base_path"],
+            target_name,
+            prompt,
+            service=f"{step.get('port') or '-'}/{step.get('protocol') or 'tcp'} {step.get('service_name') or ''}".strip(),
+            mcp="audit_llm_get_context",
+        )
         try:
             state = orch.store.get_llm_execution_state(project_id, target_id)
         except ValueError:
-            # State doesn't exist yet
             state = {
                 "commands_executed": 0,
                 "execution_time_seconds": 0.0,
                 "last_command": None,
                 "last_output": None
             }
-        
-        MAX_COMMANDS = 50
-        MAX_TIME = 1800  # 30 minutes
-        
+        max_commands = 50
+        max_time = 1800
         return {
             "success": True,
             "project_id": project_id,
             "target_id": target_id,
             "target_name": target.get("ip_or_hostname"),
-            "host_context": context,
-            "execution_state": state,
+            "step": handoff["step"],
+            "prompt": handoff["prompt"],
+            "continue_with": handoff["continue_with"],
+            "instructions": handoff["prompt"],
             "limits": {
-                "max_commands": MAX_COMMANDS,
-                "max_time_seconds": MAX_TIME,
-                "commands_remaining": MAX_COMMANDS - state.get("commands_executed", 0),
-                "time_remaining": MAX_TIME - state.get("execution_time_seconds", 0)
+                "max_commands": max_commands,
+                "max_time_seconds": max_time,
+                "commands_remaining": max_commands - state.get("commands_executed", 0),
+                "time_remaining": max_time - state.get("execution_time_seconds", 0),
             },
-            "instructions": (
-                "Based on the previous outputs, decide the next command to execute. "
-                "Use audit_llm_next_command to execute it. "
-                "You have full control within the limits. "
-                "Focus on reconnaissance, enumeration, and safe vulnerability verification."
-            )
         }
     
     return _handle(_impl)
+
+
+@mcp.tool(structured_output=False)
+async def audit_llm_continue(
+    project_id: str,
+    target_id: str,
+) -> str:
+    """
+    [Type 3] LLM finished the current profile step. Run the next profile script.
+
+    Call this after analyzing the port that just finished. Optional extra commands
+    and findings belong in audit_llm_next_command and audit_record_finding before this call.
+    Returns the next port's prompt, or done=true when the profile for this target is finished.
+    """
+    orch = get_orchestrator()
+    project = orch.store.get_project(project_id)
+    _show_llm(
+        project["base_path"],
+        asset=orch.store.get_target(target_id).get("ip_or_hostname") or target_id,
+        phase="LLM",
+        status="running",
+        llm="continue profile",
+        mcp="audit_llm_continue",
+        command="-",
+        output="-",
+        ask="-",
+        answer="-",
+        last="next port",
+    )
+    try:
+        result = await orch.continue_type3(project_id, target_id)
+        if result.get("done"):
+            step = None
+            prompt = None
+            note = "Profile finished for this target."
+            action = None
+            continue_with = None
+        else:
+            handoff = orch.type3_handoff(project_id, target_id)
+            step = handoff["step"]
+            note = handoff["prompt"]
+            action = handoff["prompt"]
+            continue_with = handoff["continue_with"]
+            prompt = handoff["prompt"]
+        return _ok({
+            "success": True,
+            "done": bool(result.get("done")),
+            "project_id": project_id,
+            "target_id": target_id,
+            "target_name": result.get("target_name"),
+            "findings_created": result.get("findings_created", 0),
+            "step": step,
+            "prompt": prompt,
+            "continue_with": continue_with,
+            "next_action": action,
+            "note": note,
+        })
+    except AuditOrchestratorError as e:
+        return _err(e.code, e.message)
+    except Exception as e:
+        return _err("internal_error", str(e))
 
 
 @mcp.tool(structured_output=False)
@@ -1105,11 +1385,11 @@ def audit_llm_next_command(
     timeout: int = 600
 ) -> str:
     """
-    [Type 3 Mode] Execute next command in LLM-controlled audit.
-    
-    The LLM has full control to decide what command to run next based on
-    previous results. Commands are validated against security constraints
-    and execution limits are enforced (50 commands, 30 minutes per target).
+    [Type 3] Run one extra command for the port that is waiting.
+
+    Use it only to repeat or deepen that same port. Do not send a command
+    that already returned output. When the port needs nothing more, call
+    audit_llm_continue instead. Limits: 50 commands and 30 minutes per target.
     
     Args:
         project_id: Project ID
@@ -1165,6 +1445,10 @@ def audit_llm_next_command(
                 "limit_reached",
                 f"Time limit reached: {MAX_TIME}s ({time_used:.1f}s used)"
             )
+
+        previous = state.get("last_command") or ""
+        if previous and _normalize_command(previous) == _normalize_command(command):
+            return _continue_after_repeat(orch, project, project_id, target_id, target_name, command)
         
         # Validate command safety
         is_safe, reason_blocked = validate_safe_command(command)
@@ -1174,10 +1458,37 @@ def audit_llm_next_command(
                 f"Command blocked: {reason_blocked}"
             )
         
-        # Execute command
+        _show_llm(
+            project["base_path"],
+            asset=target_name,
+            phase="LLM",
+            llm="asking",
+            mcp="audit_llm_next_command",
+            command=command,
+            ask=reason,
+            status="running",
+        )
         kali_client = KaliMCPClient(orch.settings.kali_server_url)
         result = asyncio.run(kali_client.execute(command, timeout))
-        
+        reply = result.get("stdout") or result.get("stderr") or ""
+        next_action = (
+            "Do not send this command again. Read stdout. "
+            "If this port needs nothing more, call "
+            f'audit_llm_continue(project_id="{project_id}", target_id="{target_id}"). '
+            "Send another audit_llm_next_command only when the command is different "
+            "and it deepens this same port."
+        )
+        _record_llm_prompt(
+            project["base_path"],
+            target_name,
+            next_action,
+            answer=reply,
+            mcp="audit_llm_next_command",
+            command=command,
+            output=reply,
+            status=f"exit {result.get('exit_code')}",
+        )
+
         # Update execution state
         new_commands = commands_executed + 1
         new_time = time_used + result.get("execution_time", 0)
@@ -1214,7 +1525,13 @@ def audit_llm_next_command(
                 "time_elapsed": new_time,
                 "time_remaining": MAX_TIME - new_time,
                 "limit_reached": new_commands >= MAX_COMMANDS or new_time >= MAX_TIME
-            }
+            },
+            "continue_with": {
+                "tool": "audit_llm_continue",
+                "project_id": project_id,
+                "target_id": target_id,
+            },
+            "next_action": next_action,
         }
     
     return _handle(_impl)

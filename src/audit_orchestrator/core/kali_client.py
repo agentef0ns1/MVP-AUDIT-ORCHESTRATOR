@@ -36,6 +36,24 @@ class KaliMCPClient:
             await self._client.aclose()
             self._client = None
     
+    async def execute(
+        self,
+        command: str,
+        timeout: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Run a command and return the fields Type 2 and Type 3 callers expect."""
+        result = await self.execute_command(command, timeout=timeout)
+        stdout = result.get("output") or ""
+        return {
+            **result,
+            "stdout": stdout,
+            "output": stdout,
+            "stderr": result.get("stderr") or "",
+            "exit_code": result.get("exit_code", -1),
+            "success": bool(result.get("success")),
+            "execution_time": result.get("duration") or result.get("execution_time") or 0,
+        }
+
     async def execute_command(
         self,
         command: str,
