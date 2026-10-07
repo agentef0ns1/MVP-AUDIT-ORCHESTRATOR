@@ -240,6 +240,28 @@ def _record_llm_prompt(
         return
 
 
+def _hosts_waiting_for_llm(orch, project_id: str) -> list[dict[str, Any]]:
+    """Hosts whose enumeration already finished and are waiting for analysis."""
+    waiting: list[dict[str, Any]] = []
+    for target in orch.store.get_targets_by_project(project_id, status="pending_llm_analysis"):
+        services = []
+        for service in orch.store.get_services_by_target(target["target_id"]):
+            services.append({
+                "port": service.get("port"),
+                "protocol": service.get("protocol"),
+                "service_name": service.get("service_name"),
+                "version": service.get("version"),
+                "status": service.get("status"),
+            })
+        waiting.append({
+            "project_id": project_id,
+            "target_id": target["target_id"],
+            "target_name": target.get("ip_or_hostname"),
+            "services": services,
+        })
+    return waiting
+
+
 def _type2_prompt(pending_llm: list[dict[str, Any]]) -> str:
     """Type 2 handoff: the instruction plus the service index sent with it."""
     lines = [_next_action_for("type_2_post_host_llm"), ""]
@@ -621,21 +643,26 @@ async def audit_resume(
     base_path: str,
     input_file: str = "open_ports.txt",
     max_targets: int | None = None,
+    max_concurrent: int = 10,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
-    Resume/continue audit from a directory without knowing project_id.
-    
-    Finds the project by base_path and continues execution.
-    Useful for resuming interrupted audits or continuing partial runs.
-    
+    Resume pending and interrupted hosts in parallel.
+
+    Stays on this MCP server. Project ids from this server are not valid on
+    audit-orchestrator-v2. Do not search the filesystem for the server code.
+    Up to max_concurrent hosts run at the same time. Hosts left in auditing are
+    included. After this call, analyze pending_llm[0] with audit_llm_analyze_host
+    on this same server.
+
     Args:
         base_path: Base directory of the audit project
         input_file: Name of input file (default: open_ports.txt)
-        max_targets: Optional limit on targets to process
-    
+        max_targets: Hosts to enumerate this call (default: all remaining)
+        max_concurrent: Hosts running at the same time (default: 10)
+
     Returns:
-        JSON with execution results and status
+        JSON with project_id, the prompt, and the hosts waiting for the LLM
     """
     orch = get_orchestrator()
     screen = _bind_live(ctx) if ctx is not None else LiveScreen()
@@ -649,12 +676,34 @@ async def audit_resume(
                 f"No audit project found at {base_path}. Use audit_start_and_run() to create one."
             )
         _arm_live_console(base_path)
-        run_result = await orch.run_audit(project_id, max_targets)
+        run_result = await orch.run_audit_parallel(
+            project_id,
+            max_targets=max_targets,
+            max_concurrent=max_concurrent,
+            auto_review=False,
+        )
+        pending_llm = _hosts_waiting_for_llm(orch, project_id)
+        mode = project.get("execution_mode", "type_1_no_llm")
+        prompt = _type2_prompt(pending_llm) if pending_llm and mode == "type_2_post_host_llm" else None
+        first = pending_llm[0] if pending_llm else None
+        note = "Audit resumed on this server. Do not call audit-orchestrator-v2 and do not search the source tree."
+        if first:
+            note += (
+                " Next, call audit_llm_analyze_host on this server with "
+                f'project_id="{project_id}" and target_id="{first["target_id"]}".'
+            )
+        if prompt:
+            _record_llm_prompt(
+                base_path,
+                first.get("target_name") or "target",
+                prompt,
+                mcp="audit_llm_analyze_host",
+            )
         payload = {
             "success": True,
             "project_id": project_id,
             "base_path": base_path,
-            "execution_mode": project.get("execution_mode", "type_1_no_llm"),
+            "execution_mode": mode,
             "execution": {
                 "targets_processed": run_result.get("targets_processed", 0),
                 "targets_completed": run_result.get("targets_completed", 0),
@@ -662,7 +711,10 @@ async def audit_resume(
                 "findings_created": run_result.get("findings_created", 0)
             },
             "status": run_result.get("status", "completed"),
-            "note": "Audit resumed and executed. Results in: " + base_path
+            "pending_llm": pending_llm,
+            "prompt": prompt,
+            "next_action": prompt,
+            "note": note,
         }
         return await _ok_live(payload, screen)
     except AuditOrchestratorError as e:

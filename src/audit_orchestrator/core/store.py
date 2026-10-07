@@ -390,13 +390,13 @@ class AuditStore:
             return data
     
     def get_all_pending_targets(self, project_id: str) -> list[dict[str, Any]]:
-        """Get all pending targets for parallel processing"""
+        """Pending hosts, plus hosts left in auditing by an interrupted run."""
         with self.db.connection() as conn:
             cursor = conn.execute("""
                 SELECT * FROM targets
                 WHERE project_id = ?
-                AND status = 'pending'
-                ORDER BY created_at
+                AND status IN ('pending', 'auditing')
+                ORDER BY CASE status WHEN 'auditing' THEN 0 ELSE 1 END, started_at
             """, (project_id,))
             
             rows = cursor.fetchall()
