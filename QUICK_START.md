@@ -1,309 +1,256 @@
-# Quick Start Guide - MVP Audit Orchestrator
+# Quick Start — comandos MCP para el agente Cline
 
-## 1. Installation (5 minutes)
+Servidor MCP: `audit-orchestrator` (este repositorio).
+El agente invoca estas herramientas. El fichero de entrada es un nmap (`-oN`, `-oG`, `-oX` o varios hosts concatenados) dentro de `base_path`. Por defecto se llama `open_ports.txt`. El perfil por defecto es `default_blackbox`.
 
-```bash
-cd /opt/cline-mcps/MVP-audit-orchestrator
-chmod +x scripts/install.sh
-./scripts/install.sh
-```
+`parallel=true` ejecuta varios hosts a la vez. `max_concurrent` es el tope de hilos (hosts simultáneos). Por defecto vale `10`.
 
-## 2. Configure Kali Server URL (Optional)
-
-**Default**: `http://127.0.0.1:5001`
-
-If your Kali MCP server uses a different port or host:
-
-```bash
-export KALI_SERVER_URL="http://127.0.0.1:8080"
-```
-
-Or set permanently in `~/.bashrc`:
-```bash
-echo 'export KALI_SERVER_URL="http://kali-server:5001"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-📖 **Full config guide**: [CONFIGURAR_PUERTO_KALI.md](CONFIGURAR_PUERTO_KALI.md)
-
-## 3. Configure MCP Client
-
-**For Cline:**
-Edit `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-
-**For Cursor:**
-Edit `~/.cursor-tutor/mcp.json`
-
-Add:
-```json
-{
-  "mcpServers": {
-    "audit-orchestrator": {
-      "command": "/opt/cline-mcps/MVP-audit-orchestrator/.venv/bin/python",
-      "args": [
-        "-m", "audit_orchestrator.mcp_server",
-        "--kali-server-url", "http://127.0.0.1:5001",
-        "--data-dir", "/home/f0ns1/.local/share/audit-orchestrator"
-      ],
-      "env": {
-        "AUDIT_MAX_CONCURRENT": "10"
-      },
-      "timeout": 3600
-    }
-  }
-}
-```
-
-## 4. Verify MCP Kali is Running
-
-```bash
-# Quick health check
-curl http://127.0.0.1:5001/health
-
-# Or run comprehensive verification (v0.1.1+)
-cd /opt/cline-mcps/MVP-audit-orchestrator
-./scripts/verify-fix.sh
-```
-
-**Expected:** All checks should pass ✅
-
-If not running, start your MCP Kali server:
-```bash
-kali-server-mcp --ip 0.0.0.0 --port 5001
-```
-
-## 5. Prepare nmap input
-
-Any of these files can be the audit input. The parser picks the format automatically.
-
-```bash
-nmap -sV -p- --min-rate 5000 -v 10.19.220.0/24 -oN open_ports.txt
-
-# or several hosts concatenated
-for i in $(cat hosts.txt); do
-  echo "$i"
-  nmap -p- --min-rate 5000 -v "$i" | grep open
-done > open_ports.txt
-```
-
-See [docs/FORMATOS_NMAP.md](docs/FORMATOS_NMAP.md).
-
-## 6. Run Your First Audit
-
-### Option A: Simple Prompt
-
-Send to your LLM:
-```
-Usa audit-orchestrator:
-1. audit_start con base_path="/home/f0ns1/RedTeam/OCSR25/PoC/" y input_file="open_ports.txt"
-2. audit_run con el project_id devuelto
-3. Continúa hasta que done sea true
-4. audit_finalize para generar resumen
-```
-
-### Option B: Step by Step
-
-```
-1. audit_start(
-     base_path="/home/f0ns1/RedTeam/OCSR25/PoC/",
-     input_file="open_ports.txt",
-     profile="default_blackbox"
-   )
-```
-
-Note the `project_id` from response.
-
-```
-2. audit_run(project_id="<your-project-id>")
-```
-
-Wait for completion (`done: true`).
-
-```
-3. audit_finalize(project_id="<your-project-id>")
-```
-
-## 7. Check Results
-
-```bash
-cd /home/f0ns1/RedTeam/OCSR25/PoC/
-
-# View executive summary
-cat RESUMEN-AUDITORIA.md
-
-# Browse target directories
-ls -la 10.19.220.*/
-
-# View findings for a target
-cat 10.19.220.23/findings/INDICE.md
-
-# View audit log
-cat 10.19.220.23/bitacora/audit_*.log
-```
-
-## 8. Monitor Progress (Optional)
-
-While audit is running:
-```
-audit_status(project_id="<your-project-id>")
-```
-
-Returns:
-- Current target being audited
-- Services completed
-- Findings count
-- Last operation
-
-## Input File Format
-
-The parser accepts nmap normal (`-oN`), grepable (`-oG`), XML (`-oX`), and several scans concatenated from a `for` loop. Details: [docs/FORMATOS_NMAP.md](docs/FORMATOS_NMAP.md).
-
-A legacy plaintext file still works:
-
-```
-10.19.220.23
-Discovered open port 22/tcp on 10.19.220.23
-Discovered open port 8088/tcp on 10.19.220.23
-22/tcp   open  ssh
-8088/tcp open  radan-http
-
-10.19.220.24
-Discovered open port 80/tcp on 10.19.220.24
-80/tcp   open  http
-```
-
-## Common Commands
-
-### List all projects
-```
-audit_list_projects()
-```
-
-### Get findings for a project
-```
-audit_get_findings(project_id="<id>", severity="high")
-```
-
-### View audit log
-```
-audit_get_bitacora(project_id="<id>", target="10.19.220.23")
-```
-
-### Test Kali connection
-```
-kali_test_connection()
-```
-
-## Expected Timeline
-
-For your current scan (52 targets, 948 ports):
-- **Setup:** 5 minutes
-- **Per target:** ~5-20 minutes (depends on services)
-- **Total estimate:** 4-17 hours (if no issues)
-
-The orchestrator will continue automatically even if you disconnect!
-
-## Output Structure
-
-```
-/home/f0ns1/RedTeam/OCSR25/PoC/
-├── open_ports.txt              # Your input
-├── RESUMEN-AUDITORIA.md        # Executive summary
-├── 10.19.220.10/
-│   ├── enumeration/
-│   │   ├── ports.json
-│   │   ├── nmap_version_*.txt
-│   │   ├── whatweb_*.txt
-│   │   └── ...
-│   ├── bitacora/
-│   │   └── audit_20260930.log
-│   └── findings/
-│       ├── INDICE.md
-│       └── FIND-*.md
-├── 10.19.220.11/
-│   └── ...
-└── ...
-```
-
-## Troubleshooting
-
-### "Could not connect to MCP Kali server"
-```bash
-# Check if Kali server is running
-curl http://127.0.0.1:5001/health
-
-# Start Kali server if needed
-cd /opt/cline-mcps/MCP-Kali-Server
-# (follow Kali server startup instructions)
-```
-
-### Audit seems stuck
-```
-# Check status
-audit_status(project_id="<id>")
-
-# Check last log entry
-audit_get_bitacora(project_id="<id>", limit=10)
-```
-
-### Need to stop and resume
-The audit automatically saves progress. Just run:
-```
-audit_run(project_id="<same-id>")
-```
-
-It will continue from where it stopped!
-
-## What It Does
-
-✅ **Enumerates:**
-- Service versions
-- Web technologies
-- SSL/TLS configuration
-- Available services
-- Directory structure (fuzzing)
-
-✅ **Detects:**
-- CVEs (vulnerable versions)
-- Anonymous access
-- Default credentials
-- Weak SSL/TLS
-- Missing WAF
-
-❌ **Does NOT:**
-- Execute exploits
-- Brute force passwords
-- Perform DoS attacks
-- Modify target systems
-
-## Getting Help
-
-1. **Check README.md** - Full documentation
-2. **Check IMPLEMENTATION.md** - Technical details
-3. **View logs:** `~/.local/share/audit-orchestrator/`
-4. **SQLite DB:** `~/.local/share/audit-orchestrator/audit_state.db`
-
-## Safety Notes
-
-⚠️ **IMPORTANT:**
-- Only use on authorized networks
-- This is BLACK-BOX enumeration only
-- No destructive operations
-- All commands logged in bitacora
-- Data stays local (100% on-premise)
+Al terminar una auditoría, llamar `audit_finalize(project_id)`.
 
 ---
 
-```bash
-# Un solo comando para todo
+## Ejemplo tipo 1 — `type_1_no_llm`
+
+Secuencia fija del perfil JSON. No interviene el LLM. Es el modo para una auditoría automática y repetible.
+
+```text
 audit_start_and_run(
     base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
     input_file="open_ports.txt",
-    execution_mode="type_2_post_host_llm"
+    profile="default_blackbox",
+    execution_mode="type_1_no_llm",
+    reset=false,
+    parallel=true,
+    max_concurrent=10
 )
-# Ver estado sin recordar el UUID
-audit_status_by_path(base_path="/home/f0ns1/RedTeam/OCSR25/PoC")
-# Continuar si se interrumpió
-audit_resume(base_path="/home/f0ns1/RedTeam/OCSR25/PoC")
 ```
-**Ready to start? Run the installation and configure your MCP client!**
+
+Cuando la respuesta traiga `status=completed` y `done` implícito (sin `pending_llm`):
+
+```text
+audit_finalize(project_id="<project_id>")
+```
+
+---
+
+## Ejemplo tipo 2 — `type_2_post_host_llm`
+
+El perfil enumera cada host. Después el agente analiza los resultados y puede lanzar como máximo una prueba segura por puerto. Sin DoS, sin fuerza bruta y sin explotación.
+
+```text
+audit_start_and_run(
+    base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
+    input_file="open_ports.txt",
+    profile="default_blackbox",
+    execution_mode="type_2_post_host_llm",
+    reset=false,
+    parallel=true,
+    max_concurrent=10
+)
+```
+
+Si la respuesta trae `pending_llm`, seguir con el primer host (`pending_llm[0]`):
+
+```text
+audit_llm_analyze_host(
+    project_id="<project_id>",
+    target_id="<target_id>"
+)
+```
+
+Esa llamada devuelve el índice de servicios. Repetirla con `port` para leer un servicio:
+
+```text
+audit_llm_analyze_host(
+    project_id="<project_id>",
+    target_id="<target_id>",
+    port=443
+)
+```
+
+Como máximo un comando seguro para ese puerto, o ninguno:
+
+```text
+audit_llm_execute_poc(
+    project_id="<project_id>",
+    target_id="<target_id>",
+    command="curl -skI https://10.19.220.23/",
+    reason="Comprobar cabeceras del servicio HTTPS ya enumerado en el puerto 443"
+)
+```
+
+Un hallazgo real se registra con:
+
+```text
+audit_record_finding(
+    project_id="<project_id>",
+    target="10.19.220.23",
+    severity="medium",
+    title="Título del hallazgo",
+    description="Qué se observó en la salida de la enumeración",
+    port=443,
+    service="https",
+    evidence="Extracto de la salida"
+)
+```
+
+Pasar al siguiente puerto del índice hasta agotar los servicios del host, y luego al siguiente elemento de `pending_llm`.
+
+---
+
+## Ejemplo tipo 3 — `type_3_interactive_llm`
+
+Solo corre el arranque del perfil y se detiene en cada puerto. El agente lee el prompt de ese puerto, puede registrar un hallazgo o profundizar con un comando, y después pide el puerto siguiente. Límite: 50 comandos o 30 minutos por host.
+
+```text
+audit_start_and_run(
+    base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
+    input_file="open_ports.txt",
+    profile="default_blackbox",
+    execution_mode="type_3_interactive_llm",
+    reset=false,
+    parallel=true,
+    max_concurrent=10
+)
+```
+
+La respuesta trae `prompt`, `step` y `continue_with`. Para releer el puerto que acaba de terminar:
+
+```text
+audit_llm_get_context(
+    project_id="<project_id>",
+    target_id="<target_id>"
+)
+```
+
+Para repetir o profundizar solo ese puerto:
+
+```text
+audit_llm_next_command(
+    project_id="<project_id>",
+    target_id="<target_id>",
+    command="whatweb -a 1 https://10.19.220.23:443",
+    reason="El puerto 443 respondió HTTPS y falta identificar la tecnología"
+)
+```
+
+Cuando ese puerto no necesita nada más, el siguiente puerto se lanza con:
+
+```text
+audit_llm_continue(
+    project_id="<project_id>",
+    target_id="<target_id>"
+)
+```
+
+Repetir hasta que `audit_llm_continue` devuelva `done=true`. Entonces `audit_finalize(project_id)`.
+
+---
+
+## Paralelo multithread y `max_concurrent`
+
+`parallel=true` audita varios hosts a la vez. `max_concurrent` es el número máximo de hilos (hosts simultáneos). El valor por defecto es `10`. Subirlo acelera la auditoría y carga más el servidor Kali.
+
+Arranque con 20 hosts a la vez:
+
+```text
+audit_start_and_run(
+    base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
+    input_file="open_ports.txt",
+    profile="default_blackbox",
+    execution_mode="type_1_no_llm",
+    reset=false,
+    parallel=true,
+    max_concurrent=20
+)
+```
+
+El mismo tope sobre un proyecto ya creado:
+
+```text
+audit_run(
+    project_id="<project_id>",
+    parallel=true,
+    max_concurrent=20
+)
+```
+
+Reanudar hosts pendientes o interrumpidos, también en paralelo. Esta llamada siempre corre en paralelo:
+
+```text
+audit_resume(
+    base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
+    input_file="open_ports.txt",
+    max_concurrent=20
+)
+```
+
+Un hilo cada vez (depuración):
+
+```text
+audit_run(
+    project_id="<project_id>",
+    parallel=false
+)
+```
+
+---
+
+## Estado de una auditoría
+
+Por `project_id`. Devuelve `status`, `profile`, `statistics` (targets, servicios y hallazgos), `last_operation`, `next_target` y `done`.
+
+```text
+audit_status(project_id="<project_id>")
+```
+
+Por directorio, sin recordar el UUID. `input_file` tiene que ser el mismo con el que se creó el proyecto.
+
+```text
+audit_status_by_path(
+    base_path="/home/f0ns1/RedTeam/OCSR25/PoC",
+    input_file="open_ports.txt"
+)
+```
+
+Listar proyectos. `status` admite `running`, `completed` o `paused`.
+
+```text
+audit_list_projects(status="running", limit=50)
+```
+
+Hosts del proyecto. `status` opcional: `pending`, `auditing`, `completed`, `failed`, `pending_llm_analysis`.
+
+```text
+audit_get_targets(
+    project_id="<project_id>",
+    status="pending"
+)
+```
+
+Hallazgos. `severity` opcional: `critical`, `high`, `medium`, `low`, `info`.
+
+```text
+audit_get_findings(
+    project_id="<project_id>",
+    severity="high"
+)
+```
+
+Bitácora. `target` y `limit` son opcionales.
+
+```text
+audit_get_bitacora(
+    project_id="<project_id>",
+    target="10.19.220.23",
+    limit=20
+)
+```
+
+Cerrar y generar `RESUMEN-AUDITORIA.md`:
+
+```text
+audit_finalize(project_id="<project_id>")
+```
+
+`done=true` en `audit_status` indica que no queda ningún host pendiente.
